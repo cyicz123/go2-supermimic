@@ -362,7 +362,7 @@ def test_gait_wz_gating_standing_5x_and_reward_terms() -> None:
 
 
 def test_self_collision_box_sdf_and_soft_termination_and_critic_dim() -> None:
-  consts = _synthetic_consts(3, "cpu")
+  consts = _synthetic_consts(4, "cpu")
   imag = WbcImagination(WbcImagineCfg(horizon=32, obs_noise=False), consts, "cpu")
 
   # Direct Box-SDF check: outside -> 0.0, inside -> > 0 and -grad pushes outward
@@ -414,9 +414,12 @@ def test_self_collision_box_sdf_and_soft_termination_and_critic_dim() -> None:
 
   q_safe_0 = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
   q_safe_work = [0.2, 1.57, -1.35, -0.3, -0.5, 0.4]
-  q_batch = torch.tensor([q_safe_0, q_safe_work, battery_hit], dtype=torch.float32, requires_grad=True)
+  q_link0_hit = [-1.742942, 3.136042, -0.012333, -0.542687, 0.251691, -0.897018]
+  q_batch = torch.tensor(
+    [q_safe_0, q_safe_work, battery_hit, q_link0_hit], dtype=torch.float32, requires_grad=True
+  )
   fk = piper_fk(q_batch)
-  s = _make_standing_state(3, "cpu", base_z=0.30)
+  s = _make_standing_state(4, "cpu", base_z=0.30)
   d, pens, (d_ori, d_base, d_col) = imag.termination_prob(s, fk)
   assert (d >= 0.0).all() and (d <= 1.0).all()
   assert (d_ori >= 0.0).all() and (d_base >= 0.0).all() and (d_col >= 0.0).all()
@@ -430,6 +433,19 @@ def test_self_collision_box_sdf_and_soft_termination_and_critic_dim() -> None:
   # Real battery & base collision poses must register positive penetration and elevated d_col
   assert pens[2].sum().item() > 0.0
   assert d_col[2].item() > 0.01
+
+  # Real link0_collision pose (link4/link5 hitting link0) must also register > 0, elevated d_col, and push-out grad
+  assert pens[3].sum().item() > 0.02
+  assert d_col[3].item() > 0.10
+  q_l0_t = torch.tensor([q_link0_hit], dtype=torch.float32, requires_grad=True)
+  l0_pen_before = float(imag.collision_penetration(piper_fk(q_l0_t)).sum().item())
+  (-imag.collision_penetration(piper_fk(q_l0_t)).sum()).backward()
+  assert q_l0_t.grad is not None and torch.isfinite(q_l0_t.grad).all()
+  g_l0 = q_l0_t.grad[0].detach()
+  assert g_l0.norm().item() > 0.0
+  q_l0_nudged = torch.tensor([q_link0_hit], dtype=torch.float32) + 1e-3 * (g_l0 / g_l0.norm())
+  l0_pen_after = float(imag.collision_penetration(piper_fk(q_l0_nudged)).sum().item())
+  assert l0_pen_after < l0_pen_before
 
   # Also check base_hit explicitly
   q_base_t = torch.tensor([base_hit], dtype=torch.float32, requires_grad=True)
@@ -461,17 +477,17 @@ def test_self_collision_box_sdf_and_soft_termination_and_critic_dim() -> None:
   assert float(rollout_data["surv"][:, -1].min().item()) >= 0.99
 
   # Critic input dimension 114D flat
-  k = imag.rollout_constants(torch.arange(3))
+  k = imag.rollout_constants(torch.arange(4))
   crit = imag.critic_input(
     s,
-    torch.zeros(3, 3),
-    torch.zeros(3, 6),
-    torch.zeros(3, 3),
-    torch.zeros(3, 7),
-    torch.ones(3, 9),
+    torch.zeros(4, 3),
+    torch.zeros(4, 6),
+    torch.zeros(4, 3),
+    torch.zeros(4, 7),
+    torch.ones(4, 9),
     k,
   )
-  assert crit.shape == (3, 114)
+  assert crit.shape == (4, 114)
 
 
 def test_gae_targets_uses_exact_continuation_without_surv_clamp() -> None:
@@ -694,6 +710,72 @@ def test_resume_restores_common_step_counter_and_curriculum_before_first_reset(
     assert ee_t2.cfg.trajectory_mode_prob == pytest.approx(0.40)
   finally:
     t2.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA GPU")
+def test_consecutive_multi_resume_preserves_full_curriculum_curve(tmp_path: Path) -> None:
+  """P1 #2: end_step 100 (step 40 -> 40%) -> extend to 200 (step 60 -> 47.5%) -> resume at 200 keeps 47.5%."""
+  def _make_cfg(end_step: int, run_name: str, resume: str = "", continue_run: bool = False) -> WbcTrainCfg:
+    return WbcTrainCfg(
+      task="Go2Piper-WBC-Flat",
+      num_envs=8,
+      buffer_len=32,
+      iterations=1,
+      warmup_iterations=10,
+      wm_window=4,
+      wm_batch=16,
+      wm_updates=1,
+      imag_batch=8,
+      horizon=4,
+      wm_hidden=(64, 64),
+      actor_hidden=(64, 32),
+      critic_hidden=(64, 32),
+      critic_epochs=1,
+      critic_minibatches=2,
+      target_curriculum_iterations=end_step,
+      wbc_stage=2 if resume else 1,
+      resume=resume,
+      continue_run=continue_run,
+      log_root=str(tmp_path),
+      run_name=run_name,
+    )
+
+  # Phase A: end_step=100, advance common_step_counter to 40 (40% progress) and save
+  t1 = WbcTrainer(_make_cfg(100, "curve_p1"))
+  try:
+    t1.env.common_step_counter = 40
+    ckpt1 = t1.save(10)
+  finally:
+    t1.close()
+  d1 = torch.load(ckpt1, map_location="cpu", weights_only=False)
+  assert float(d1["vel_curriculum_progress"]) == pytest.approx(0.40, abs=1e-6)
+  assert float(d1["ee_curriculum_progress"]) == pytest.approx(0.40, abs=1e-6)
+
+  # Phase B: first resume extending end_step 100 -> 200; step 40 stays 40%, step 60 reaches 47.5%
+  t2 = WbcTrainer(_make_cfg(200, "curve_p2", resume=str(ckpt1), continue_run=True))
+  try:
+    assert int(t2.env.common_step_counter) == 40
+    assert float(t2.env.command_manager.get_term("base_velocity").cfg.curriculum_progress) == pytest.approx(0.40, abs=1e-6)
+    t2.env.common_step_counter = 60
+    ckpt2 = t2.save(20)
+  finally:
+    t2.close()
+  d2 = torch.load(ckpt2, map_location="cpu", weights_only=False)
+  assert float(d2["vel_curriculum_progress"]) == pytest.approx(0.475, abs=1e-6)
+  assert float(d2["ee_curriculum_progress"]) == pytest.approx(0.475, abs=1e-6)
+
+  # Phase C: second resume keeping end_step=200; must stay strictly at 47.5% (NOT drop to 30%) and advance along same curve
+  t3 = WbcTrainer(_make_cfg(200, "curve_p3", resume=str(ckpt2), continue_run=True))
+  try:
+    assert int(t3.env.common_step_counter) == 60
+    assert float(t3.env.command_manager.get_term("base_velocity").cfg.curriculum_progress) == pytest.approx(0.475, abs=1e-6)
+    assert float(t3.env.command_manager.get_term("ee_pose").cfg.curriculum_progress) == pytest.approx(0.475, abs=1e-6)
+    t3.env.common_step_counter = 80
+    t3.env.curriculum_manager.compute()
+    assert float(t3.env.command_manager.get_term("base_velocity").cfg.curriculum_progress) == pytest.approx(0.55, abs=1e-6)
+    assert float(t3.env.command_manager.get_term("ee_pose").cfg.curriculum_progress) == pytest.approx(0.55, abs=1e-6)
+  finally:
+    t3.close()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA GPU")

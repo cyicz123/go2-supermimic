@@ -86,32 +86,43 @@ class WbcTrainer:
     env_cfg.seed = cfg.seed
 
     saved_step = 0
+    new_end_step = int(cfg.target_curriculum_iterations)
     if resume_ckpt is not None and cfg.continue_run:
       saved_step = int(
         resume_ckpt.get("common_step_counter", resume_ckpt.get("iteration", 0))
       )
-      saved_end_step = int(
-        resume_ckpt.get("cfg", {}).get(
-          "target_curriculum_iterations", cfg.target_curriculum_iterations
-        )
+      saved_cur_state = resume_ckpt.get("curriculum_state", {})
+      saved_end_fallback = int(
+        resume_ckpt.get("cfg", {}).get("target_curriculum_iterations", new_end_step)
       )
       for cname, pkey in (
         ("base_velocity_levels", "vel_curriculum_progress"),
         ("ee_pose_levels", "ee_curriculum_progress"),
       ):
-        if cname in env_cfg.curriculum:
-          params = env_cfg.curriculum[cname].params
-          params["end_step"] = cfg.target_curriculum_iterations
-          if pkey in resume_ckpt and saved_end_step != cfg.target_curriculum_iterations:
+        if cname not in env_cfg.curriculum:
+          continue
+        params = env_cfg.curriculum[cname].params
+        c_state = saved_cur_state.get(cname) if isinstance(saved_cur_state, dict) else None
+        if isinstance(c_state, dict):
+          saved_end_step = int(c_state["end_step"])
+          if new_end_step == saved_end_step:
+            params["start_step"] = int(c_state["start_step"])
+            params["end_step"] = saved_end_step
+            params["init_progress"] = float(c_state["init_progress"])
+          else:
             params["start_step"] = saved_step
-            params["end_step"] = saved_step + max(
-              1, cfg.target_curriculum_iterations - saved_step
-            )
+            params["end_step"] = max(saved_step + 1, new_end_step)
+            params["init_progress"] = float(c_state["progress"])
+        else:
+          params["end_step"] = new_end_step
+          if pkey in resume_ckpt and saved_end_fallback != new_end_step:
+            params["start_step"] = saved_step
+            params["end_step"] = max(saved_step + 1, new_end_step)
             params["init_progress"] = float(resume_ckpt[pkey])
     else:
       for cname in ("base_velocity_levels", "ee_pose_levels"):
         if cname in env_cfg.curriculum:
-          env_cfg.curriculum[cname].params["end_step"] = cfg.target_curriculum_iterations
+          env_cfg.curriculum[cname].params["end_step"] = new_end_step
 
     self.env_cfg = env_cfg
     self.env = ManagerBasedRlEnv(cfg=env_cfg, device="cuda:0")
@@ -516,6 +527,19 @@ class WbcTrainer:
     self.env.curriculum_manager.compute()
     vel_term = self.env.command_manager.get_term("base_velocity")
     ee_term = self.env.command_manager.get_term("ee_pose")
+    curriculum_state = {}
+    for cname, term in (
+      ("base_velocity_levels", vel_term),
+      ("ee_pose_levels", ee_term),
+    ):
+      if cname in self.env_cfg.curriculum:
+        params = self.env_cfg.curriculum[cname].params
+        curriculum_state[cname] = {
+          "start_step": int(params.get("start_step", 0)),
+          "end_step": int(params.get("end_step", self.cfg.target_curriculum_iterations)),
+          "init_progress": float(params.get("init_progress", 0.0)),
+          "progress": float(term.cfg.curriculum_progress),
+        }
     torch.save(
       {
         "supermimic": True,
@@ -525,6 +549,7 @@ class WbcTrainer:
         "common_step_counter": int(self.env.common_step_counter),
         "vel_curriculum_progress": float(vel_term.cfg.curriculum_progress),
         "ee_curriculum_progress": float(ee_term.cfg.curriculum_progress),
+        "curriculum_state": curriculum_state,
         "cfg": asdict(self.cfg),
         "actor": self.actor.state_dict(),
         "critic": self.critic.state_dict(),

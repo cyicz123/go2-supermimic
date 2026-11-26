@@ -86,9 +86,11 @@ WBC_CRITIC_BASE_DIM: int = (
 _COLLISION_LINK_ORDER: tuple[str, ...] = tuple(name for name, _ in PIPER_COLLISION_LINK_GEOMS)
 
 _BODY_COLLISION_BOX_GROUPS: tuple[tuple[str, ...], ...] = (
+  ("link0_collision",),
   ("front_battery_collision_box",),
   ("base_collision",),
-  ("head_collision1", "head_collision2", "d415_head_camera_collision_camera_main"),
+  ("head_collision1", "head_collision2"),
+  ("d415_head_camera_collision_camera_main",),
 )
 
 
