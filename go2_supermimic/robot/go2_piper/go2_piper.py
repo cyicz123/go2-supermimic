@@ -102,8 +102,6 @@ class DelayedPdActuator(IdealPdActuator["DelayedPdActuatorCfg"]):
     self.velocity_limit: torch.Tensor | None = None
     self._joint_v_adrs: torch.Tensor | None = None
     self._joint_q_adrs: torch.Tensor | None = None
-    self._joint_q_min: torch.Tensor | None = None
-    self._joint_q_max: torch.Tensor | None = None
     self._qpos_prev: torch.Tensor | None = None
     self._qpos_prev_time: torch.Tensor | None = None
     self._lags: torch.Tensor | None = None
@@ -184,18 +182,6 @@ class DelayedPdActuator(IdealPdActuator["DelayedPdActuatorCfg"]):
       assert self._target_ids is not None
       self._joint_v_adrs = self.entity.indexing.joint_v_adr[self._target_ids]
       self._joint_q_adrs = self.entity.indexing.joint_q_adr[self._target_ids]
-      mj_jnt_ids = self.entity.indexing.joint_ids[self._target_ids].detach().cpu().tolist()
-      q_mins: list[float] = []
-      q_maxs: list[float] = []
-      for jid in mj_jnt_ids:
-        if mj_model.jnt_limited[jid]:
-          q_mins.append(float(mj_model.jnt_range[jid, 0]))
-          q_maxs.append(float(mj_model.jnt_range[jid, 1]))
-        else:
-          q_mins.append(float("-inf"))
-          q_maxs.append(float("inf"))
-      self._joint_q_min = torch.tensor(q_mins, dtype=torch.float, device=device).unsqueeze(0)
-      self._joint_q_max = torch.tensor(q_maxs, dtype=torch.float, device=device).unsqueeze(0)
       self.velocity_limit = torch.full(
         (num_envs, num_joints), float(self.cfg.velocity_limit), dtype=torch.float, device=device
       )
@@ -208,8 +194,6 @@ class DelayedPdActuator(IdealPdActuator["DelayedPdActuatorCfg"]):
     else:
       self._joint_v_adrs = None
       self._joint_q_adrs = None
-      self._joint_q_min = None
-      self._joint_q_max = None
       self.velocity_limit = None
       self._qpos_prev = None
       self._qpos_prev_time = None
@@ -282,8 +266,6 @@ class DelayedPdActuator(IdealPdActuator["DelayedPdActuatorCfg"]):
       and self._joint_q_adrs is not None
       and self._qpos_prev is not None
       and self._qpos_prev_time is not None
-      and self._joint_q_min is not None
-      and self._joint_q_max is not None
     ):
       sim_time = sim_data.time
       valid_step = torch.isfinite(self._qpos_prev_time) & (sim_time > self._qpos_prev_time)
@@ -291,7 +273,6 @@ class DelayedPdActuator(IdealPdActuator["DelayedPdActuatorCfg"]):
       q_new = qpos[:, self._joint_q_adrs]
       max_dq = self.velocity_limit * float(dt)
       q_limited = self._qpos_prev + torch.clamp(q_new - self._qpos_prev, min=-max_dq, max=max_dq)
-      q_limited = torch.clamp(q_limited, min=self._joint_q_min, max=self._joint_q_max)
       q_out = torch.where(valid_step.unsqueeze(-1) & vel_exceeded, q_limited, q_new)
       qpos[:, self._joint_q_adrs] = q_out
       self._qpos_prev.copy_(q_out)

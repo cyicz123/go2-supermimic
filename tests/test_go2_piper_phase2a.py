@@ -655,6 +655,43 @@ def test_delayed_pd_partial_reset_preserves_unreset_delay_queue_and_velocity_lim
   assert abs(dq_after_reset) <= 3.0 * 0.005 + 1e-5, f"Reset env pulled/overshot: {dq_after_reset}"
   assert float(j6_entity.data.joint_pos[0, j6_dof]) < -1.15
 
+  # Regression 5 (Codex Round 5 probe): Stage 1 play env with joint2 starting near upper limit
+  # (3.137 rad, +3.0 rad/s) under target 3.14 rad across 20 x 5ms substeps must NEVER snap back
+  # past -v_lim*dt when MuJoCo soft limit lets q_t cross 3.14 rad.
+  play_cfg = go2_piper_wbc_env_cfg(stage=1, micro_rough=False, play=True)
+  play_cfg.scene.num_envs = 2
+  play_cfg.events.pop("arm_pd_gains", None)
+  play_cfg.events.pop("leg_pd_gains", None)
+  play_env = ManagerBasedRlEnv(play_cfg, device="cpu")
+  try:
+    play_env.reset(seed=11)
+    p_robot = play_env.scene["robot"]
+    j2_dof = 13  # joint2
+    q_play = p_robot.data.default_joint_pos.clone()
+    q_play[:, j2_dof] = 3.137
+    v_play = torch.zeros_like(q_play)
+    v_play[:, j2_dof] = 3.0
+    p_robot.write_joint_state_to_sim(q_play, v_play)
+    play_env.sim.forward()
+    tgt_play = p_robot.data.default_joint_pos.clone()
+    tgt_play[:, j2_dof] = 3.14
+
+    q_prev_j2 = p_robot.data.joint_pos[:, j2_dof].clone()
+    for _ in range(20):
+      p_robot.set_joint_position_target(tgt_play)
+      play_env.scene.write_data_to_sim()
+      play_env.sim.step()
+      play_env.scene.update(dt=play_env.physics_dt)
+      q_curr_j2 = p_robot.data.joint_pos[:, j2_dof].clone()
+      dq_step = (q_curr_j2 - q_prev_j2).abs()
+      assert bool((dq_step <= 3.0 * 0.005 + 1e-5).all()), (
+        f"Soft-limit step jump exceeded 0.015 rad: dq={q_curr_j2 - q_prev_j2}, q={q_curr_j2}"
+      )
+      assert bool((p_robot.data.joint_vel[:, j2_dof].abs() <= 3.0 + 1e-6).all())
+      q_prev_j2 = q_curr_j2
+  finally:
+    play_env.close()
+
 
 # ---------------------------------------------------------------------------
 # 3. 50 Hz Piper slew-rate action tests (immediate q_ref_arm sync on reset)
