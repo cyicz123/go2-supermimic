@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 
 import mujoco
+import torch
 
-from mjlab.actuator import DcMotorActuatorCfg
-from mjlab.entity import EntityArticulationInfoCfg, EntityCfg
+from mjlab.actuator import IdealPdActuator, IdealPdActuatorCfg
+from mjlab.entity import Entity, EntityArticulationInfoCfg, EntityCfg
 from mjlab.utils.spec_config import CollisionCfg
 
 ##
@@ -65,6 +67,73 @@ def get_spec() -> mujoco.MjSpec:
 
 
 ##
+# DelayedPD actuator aligned with Isaac Lab #460 DelayedPDActuator semantics.
+##
+
+
+class DelayedPdActuator(IdealPdActuator["DelayedPdActuatorCfg"]):
+  """Ideal PD actuator with constant effort clamp and per-episode sampled delay lag.
+
+  Inherits ``IdealPdActuator.compute`` unchanged so ``FusedActuatorGroup`` still
+  fuses actuators sharing delay config, while sampling a per-env delay lag in
+  ``[delay_min_lag, delay_max_lag]`` on ``reset()`` and holding it constant for
+  the entire episode (``delay_hold_prob = 1.0`` disables per-step resampling).
+  """
+
+  def _sample_and_set_lags(self, env_ids: torch.Tensor | slice | None = None) -> None:
+    if self._delay_buffer is None:
+      return
+    buf = self._delay_buffer
+    if env_ids is None:
+      count = buf.batch_size
+      target_ids: torch.Tensor | slice = slice(None)
+    elif isinstance(env_ids, slice):
+      indices = range(*env_ids.indices(buf.batch_size))
+      count = len(indices)
+      target_ids = env_ids
+    else:
+      count = int(env_ids.numel()) if isinstance(env_ids, torch.Tensor) else len(env_ids)
+      target_ids = env_ids
+    if count == 0:
+      return
+    lags = torch.randint(
+      self.cfg.delay_min_lag,
+      self.cfg.delay_max_lag + 1,
+      (count,),
+      dtype=torch.long,
+      device=buf.device,
+    )
+    buf.set_lags(lags, target_ids)
+
+  def initialize(self, mj_model, model, data, device: str) -> None:
+    super().initialize(mj_model, model, data, device)
+    self._sample_and_set_lags(None)
+
+  def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+    super().reset(env_ids)
+    self._sample_and_set_lags(env_ids)
+
+
+@dataclass(kw_only=True)
+class DelayedPdActuatorCfg(IdealPdActuatorCfg):
+  """Configuration for constant-effort DelayedPD actuators (#460 parity)."""
+
+  velocity_limit: float | None = None
+  """Nominal joint velocity limit in rad/s (metadata / reference bound)."""
+
+  def __post_init__(self) -> None:
+    # Keep lag constant within each episode; reset() samples once per episode.
+    if self.delay_max_lag > 0 and self.delay_hold_prob == 0.0:
+      self.delay_hold_prob = 1.0
+    super().__post_init__()
+
+  def build(
+    self, entity: Entity, target_ids: list[int], target_names: list[str]
+  ) -> DelayedPdActuator:
+    return DelayedPdActuator(self, entity, target_ids, target_names)
+
+
+##
 # Actuator parameters (#460 golden baseline + canonical WBC leg PD).
 ##
 
@@ -106,8 +175,8 @@ DEFAULT_ARM_DELAY_LAG: tuple[int, int] = (3, 9)
 def _make_actuators(
   leg_delay: tuple[int, int] = DEFAULT_LEG_DELAY_LAG,
   arm_delay: tuple[int, int] = DEFAULT_ARM_DELAY_LAG,
-) -> tuple[DcMotorActuatorCfg, ...]:
-  """Build leg and Piper arm actuator configs with configurable physics-step lag."""
+) -> tuple[DelayedPdActuatorCfg, ...]:
+  """Build leg and Piper arm DelayedPD actuator configs with per-episode lag."""
   leg_min, leg_max = leg_delay
   arm_min, arm_max = arm_delay
   if leg_min < 0 or leg_min > leg_max:
@@ -115,39 +184,39 @@ def _make_actuators(
   if arm_min < 0 or arm_min > arm_max:
     raise ValueError(f"Invalid arm_delay={arm_delay}")
 
-  leg_hip_thigh = DcMotorActuatorCfg(
+  leg_hip_thigh = DelayedPdActuatorCfg(
     target_names_expr=(".*_hip_joint", ".*_thigh_joint"),
     stiffness=LEG_KP,
     damping=LEG_KD,
     effort_limit=23.7,
-    saturation_effort=2.0 * 23.7,
     velocity_limit=30.1,
     armature=ARMATURE,
     delay_min_lag=leg_min,
     delay_max_lag=leg_max,
+    delay_hold_prob=1.0,
   )
-  leg_calf = DcMotorActuatorCfg(
+  leg_calf = DelayedPdActuatorCfg(
     target_names_expr=(".*_calf_joint",),
     stiffness=LEG_KP,
     damping=LEG_KD,
     effort_limit=45.43,
-    saturation_effort=2.0 * 45.43,
     velocity_limit=15.7,
     armature=ARMATURE,
     delay_min_lag=leg_min,
     delay_max_lag=leg_max,
+    delay_hold_prob=1.0,
   )
   arm_cfgs = tuple(
-    DcMotorActuatorCfg(
+    DelayedPdActuatorCfg(
       target_names_expr=(joint_name,),
       stiffness=kp,
       damping=kd,
       effort_limit=eff,
-      saturation_effort=2.0 * eff,
       velocity_limit=vel,
       armature=ARMATURE,
       delay_min_lag=arm_min,
       delay_max_lag=arm_max,
+      delay_hold_prob=1.0,
     )
     for joint_name, kp, kd, eff, vel in zip(
       ARM_JOINT_NAMES,
@@ -185,7 +254,7 @@ INIT_STATE = EntityCfg.InitialStateCfg(
 _foot_regex = r"^[FR][LR]_foot_collision$"
 _collision_regex = r".*_collision.*"
 
-# All named collision geoms enabled (including arm <-> link0/base self-collisions
+# All named collision geoms enabled (including arm/EE <-> link0/base self-collisions
 # governed by <contact><exclude> in go2_piper.xml); feet get condim=6.
 FULL_COLLISION = CollisionCfg(
   geom_names_expr=(_collision_regex,),

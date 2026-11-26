@@ -99,7 +99,7 @@ class PiperSlewJointPositionAction(JointPositionAction):
     self._q_ref_prev = torch.zeros(
       self.num_envs, len(arm_index), device=self.device, dtype=torch.float32
     )
-    self._needs_sync = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+    self._sync_q_ref_from_measured(slice(None))
 
   @property
   def raw_actions(self) -> torch.Tensor:
@@ -152,13 +152,15 @@ class PiperSlewJointPositionAction(JointPositionAction):
       raise ValueError("Arm joint limits must be finite with lower <= upper.")
     return lower, upper
 
-  def _resolve_arm_base_reference(
-    self,
-    measured: torch.Tensor,
-    limits: tuple[torch.Tensor, torch.Tensor] | None,
-  ) -> torch.Tensor:
+  def _sync_q_ref_from_measured(
+    self, env_ids: Sequence[int] | torch.Tensor | slice
+  ) -> None:
+    measured = self._measured_arm_pos()
+    if not bool(torch.isfinite(measured).all()):
+      raise ValueError("Measured arm joint positions must be finite.")
+    limits = self._arm_position_limits()
     q_meas = measured if limits is None else measured.clamp(limits[0], limits[1])
-    return torch.where(self._needs_sync.unsqueeze(-1), q_meas, self._q_ref_prev)
+    self._q_ref_prev[env_ids] = q_meas[env_ids].detach()
 
   def process_actions(self, actions: torch.Tensor) -> None:
     """Clip raw actions, pass through legs, and slew-limit arm targets at 50 Hz."""
@@ -167,16 +169,12 @@ class PiperSlewJointPositionAction(JointPositionAction):
     clipped = self._clip_raw_actions(actions)
     q_cmd = clipped * self._scale + self._offset
     q_arm_cmd = q_cmd.index_select(dim=-1, index=self._arm_indices)
-    measured = self._measured_arm_pos()
-    if not bool(torch.isfinite(measured).all()):
-      raise ValueError("Measured arm joint positions must be finite.")
     limits = self._arm_position_limits()
     arm_lower = None if limits is None else limits[0]
     arm_upper = None if limits is None else limits[1]
-    q_base = self._resolve_arm_base_reference(measured, limits)
     max_delta = float(self.cfg.max_arm_vel) * float(self.cfg.policy_dt)
     q_next = _clamp_slew_target(
-      q_ref_prev=q_base,
+      q_ref_prev=self._q_ref_prev,
       q_arm_cmd=q_arm_cmd,
       arm_lower=arm_lower,
       arm_upper=arm_upper,
@@ -185,16 +183,15 @@ class PiperSlewJointPositionAction(JointPositionAction):
     processed = q_cmd.detach().clone()
     processed[:, self._arm_indices] = q_next.detach()
     self._q_ref_prev.copy_(q_next.detach())
-    self._needs_sync.fill_(False)
     self._raw_actions[:] = clipped
     self._processed_actions = processed
 
   def reset(self, env_ids: Sequence[int] | torch.Tensor | slice | None = None) -> None:
-    """Zero raw actions and mark selected envs to sync q_ref_arm on next step."""
+    """Zero raw actions and immediately sync q_ref_arm to clamped measured joint pos."""
     if env_ids is None:
       env_ids = slice(None)
     super().reset(env_ids)
-    self._needs_sync[env_ids] = True
+    self._sync_q_ref_from_measured(env_ids)
 
 
 @dataclass(kw_only=True)

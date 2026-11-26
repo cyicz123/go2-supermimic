@@ -9,6 +9,7 @@ import torch
 
 from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
 from mjlab.envs import mdp as envs_mdp
+from mjlab.managers.curriculum_manager import CurriculumTermCfg
 from mjlab.managers.event_manager import EventTermCfg
 from mjlab.managers.observation_manager import ObservationGroupCfg, ObservationTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
@@ -54,6 +55,25 @@ def wbc_previous_action(
 ) -> torch.Tensor:
   """Return clipped pre-slew 18D network action for the 210D policy contract."""
   return env.action_manager.get_term(action_name).raw_actions
+
+
+def wbc_command_curriculum(
+  env: ManagerBasedRlEnv,
+  env_ids: torch.Tensor | slice | None,
+  command_name: str,
+  start_step: int = 0,
+  end_step: int = 20_000,
+  init_progress: float = 0.0,
+) -> torch.Tensor:
+  """Advance a WBC command term's ``curriculum_progress`` toward 1.0 by step counter."""
+  del env_ids
+  init_p = max(0.0, min(1.0, float(init_progress)))
+  span = max(1, int(end_step) - int(start_step))
+  frac = max(0.0, min(1.0, (int(env.common_step_counter) - int(start_step)) / span))
+  progress = init_p + (1.0 - init_p) * frac
+  term = env.command_manager.get_term(command_name)
+  term.set_curriculum_progress(progress)
+  return torch.tensor(progress, device=env.device, dtype=torch.float32)
 
 
 def _randomize_actuator_pd_gains(
@@ -125,6 +145,8 @@ def go2_piper_wbc_env_cfg(
   stage: int = 1,
   micro_rough: bool = False,
   play: bool = False,
+  initial_curriculum_progress: float = 0.0,
+  curriculum_steps: int = 20_000,
 ) -> ManagerBasedRlEnvCfg:
   """Build canonical 210D->18D Go2+Piper WBC mjlab environment config.
 
@@ -133,7 +155,8 @@ def go2_piper_wbc_env_cfg(
     ``policy_dt = 0.02 s`` (50 Hz), matching ``LeggedManip_Lab@b2cce16`` and
     ``go2_supermimic``.
   - Arm actuator lag defaults to ``DEFAULT_ARM_DELAY_LAG = (3, 9)`` physics
-    steps (15-45 ms at 200 Hz), and leg lag defaults to ``(0, 6)`` (0-30 ms).
+    steps (15-45 ms at 200 Hz), and leg lag defaults to ``(0, 6)`` (0-30 ms),
+    sampled once per episode reset.
   """
   if stage not in (1, 2):
     raise ValueError(f"stage must be 1 or 2, got {stage}")
@@ -144,7 +167,7 @@ def go2_piper_wbc_env_cfg(
     else clean_look(TerrainEntityCfg(terrain_type="plane", terrain_generator=None))
   )
 
-  curriculum_progress = 1.0 if play else 0.0
+  curriculum_progress = 1.0 if play else max(0.0, min(1.0, float(initial_curriculum_progress)))
   arm_delay = (0, 0) if play else DEFAULT_ARM_DELAY_LAG
   leg_delay = (0, 0) if play else DEFAULT_LEG_DELAY_LAG
 
@@ -227,6 +250,8 @@ def go2_piper_wbc_env_cfg(
   }
 
   # Domain randomization skeleton (push_robot explicitly disabled).
+  # NOTE: body_mass_scale (pseudo_inertia) runs BEFORE base_com (body_com_offset)
+  # because pseudo_inertia rebuilds body_ipos from defaults before adding COM shifts.
   events = {
     "reset_base": EventTermCfg(
       mode="reset",
@@ -280,6 +305,14 @@ def go2_piper_wbc_env_cfg(
         "shared_random": True,
       },
     ),
+    "body_mass_scale": EventTermCfg(
+      mode="startup",
+      func=envs_mdp.dr.pseudo_inertia,
+      params={
+        "asset_cfg": SceneEntityCfg("robot", body_names=(".*",)),
+        "alpha_range": (-0.05, 0.05),
+      },
+    ),
     "base_com": EventTermCfg(
       mode="startup",
       func=envs_mdp.dr.body_com_offset,
@@ -287,14 +320,6 @@ def go2_piper_wbc_env_cfg(
         "asset_cfg": SceneEntityCfg("robot", body_names=("base",)),
         "operation": "add",
         "ranges": {0: (-0.05, 0.05), 1: (-0.05, 0.05), 2: (-0.01, 0.01)},
-      },
-    ),
-    "body_mass_scale": EventTermCfg(
-      mode="startup",
-      func=envs_mdp.dr.pseudo_inertia,
-      params={
-        "asset_cfg": SceneEntityCfg("robot", body_names=(".*",)),
-        "alpha_range": (-0.05, 0.05),
       },
     ),
     "leg_pd_gains": EventTermCfg(
@@ -330,6 +355,29 @@ def go2_piper_wbc_env_cfg(
     ),
   }
 
+  curriculum = {}
+  if not play:
+    curriculum = {
+      "base_velocity_levels": CurriculumTermCfg(
+        func=wbc_command_curriculum,
+        params={
+          "command_name": "base_velocity",
+          "start_step": 0,
+          "end_step": int(curriculum_steps),
+          "init_progress": curriculum_progress,
+        },
+      ),
+      "ee_pose_levels": CurriculumTermCfg(
+        func=wbc_command_curriculum,
+        params={
+          "command_name": "ee_pose",
+          "start_step": 0,
+          "end_step": int(curriculum_steps),
+          "init_progress": curriculum_progress,
+        },
+      ),
+    }
+
   return ManagerBasedRlEnvCfg(
     scene=SceneCfg(
       terrain=terrain_cfg,
@@ -343,7 +391,7 @@ def go2_piper_wbc_env_cfg(
     events=events,
     rewards={},
     terminations=terminations,
-    curriculum={},
+    curriculum=curriculum,
     viewer=ViewerConfig(
       origin_type=ViewerConfig.OriginType.ASSET_BODY,
       entity_name="robot",

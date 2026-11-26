@@ -22,6 +22,8 @@ from go2_supermimic.robot.go2_piper.go2_piper import (
   LEG_KD,
   LEG_KP,
   LEG_VELOCITY_LIMIT,
+  DelayedPdActuator,
+  DelayedPdActuatorCfg,
   get_go2_piper_robot_cfg,
   get_spec,
 )
@@ -39,6 +41,8 @@ __all__ = [
   "DEFAULT_JOINT_POS",
   "DEFAULT_JOINT_POS_DICT",
   "DEFAULT_LEG_DELAY_LAG",
+  "DelayedPdActuator",
+  "DelayedPdActuatorCfg",
   "FOOT_GEOM_NAMES",
   "FOOT_SITE_NAMES",
   "GO2_PIPER_ACTION_SCALE",

@@ -21,6 +21,7 @@ from go2_supermimic.wbc.commands import (
 from go2_supermimic.wbc.env_cfg import (
   WBC_OBS_TERMS,
   go2_piper_wbc_env_cfg,
+  wbc_command_curriculum,
   wbc_previous_action,
 )
 
@@ -41,5 +42,6 @@ __all__ = [
   "pack_ee_traj_state",
   "slew_step_arm",
   "unpack_ee_traj_state",
+  "wbc_command_curriculum",
   "wbc_previous_action",
 ]

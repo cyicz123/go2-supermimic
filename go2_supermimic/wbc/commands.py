@@ -240,17 +240,25 @@ def quadratic_bezier(
   goal: torch.Tensor,
   curve_s: torch.Tensor,
 ) -> torch.Tensor:
-  """Evaluate quadratic Bezier curve; degenerates to line when control == midpoint."""
-  if curve_s.ndim == 1:
+  """Evaluate quadratic Bezier curve for arbitrary leading dimensions ``(..., 3)``.
+
+  Supports ``curve_s`` of shape ``start.shape[:-1]`` (returning ``(..., 3)``) as
+  well as ``(N, K)`` when ``start`` is ``(N, 3)`` (returning ``(N, K, 3)``).
+  """
+  if curve_s.shape == start.shape[:-1]:
     w = curve_s.unsqueeze(-1)
     one_minus = 1.0 - w
     return one_minus.square() * start + 2.0 * one_minus * w * control + w.square() * goal
-  w = curve_s.unsqueeze(-1)
-  one_minus = 1.0 - w
-  return (
-    one_minus.square() * start.unsqueeze(1)
-    + 2.0 * one_minus * w * control.unsqueeze(1)
-    + w.square() * goal.unsqueeze(1)
+  if curve_s.ndim == start.ndim and curve_s.shape[:-1] == start.shape[:-1]:
+    w = curve_s.unsqueeze(-1)
+    one_minus = 1.0 - w
+    return (
+      one_minus.square() * start.unsqueeze(-2)
+      + 2.0 * one_minus * w * control.unsqueeze(-2)
+      + w.square() * goal.unsqueeze(-2)
+    )
+  raise ValueError(
+    f"Incompatible shapes for quadratic_bezier: start={tuple(start.shape)}, curve_s={tuple(curve_s.shape)}"
   )
 
 
@@ -261,19 +269,25 @@ def slerp_wxyz(
   *,
   make_unique: bool = True,
 ) -> torch.Tensor:
-  """Shortest-arc SLERP on ``WXYZ`` quaternions."""
-  weight = curve_s if curve_s.ndim == 2 else curve_s.unsqueeze(-1)
-  dot = torch.sum(start * goal, dim=-1, keepdim=True)
-  goal = torch.where(dot < 0.0, -goal, goal)
-  dot = dot.abs().clamp(-1.0, 1.0)
-  theta = torch.acos(dot)
-  sin_theta = torch.sin(theta)
-  nearly_parallel = sin_theta.abs() < 1e-6
-  safe_sin = sin_theta.clamp(min=1e-6)
-  start_weight = torch.sin((1.0 - weight) * theta) / safe_sin
-  goal_weight = torch.sin(weight * theta) / safe_sin
-  blended = start_weight * start + goal_weight * goal
-  linear = (1.0 - weight) * start + weight * goal
+  """Shortest-arc SLERP on ``WXYZ`` quaternions with arbitrary leading dims and finite autograd.
+
+  Masks near-collinear inputs (``|dot| > 1 - 1e-4``) before ``torch.acos`` so
+  equal or antipodal quaternions never produce ``NaN`` gradients during backprop.
+  """
+  weight = curve_s if curve_s.ndim == start.ndim else curve_s.unsqueeze(-1)
+  dot_raw = torch.sum(start * goal, dim=-1, keepdim=True)
+  goal_aligned = torch.where(dot_raw < 0.0, -goal, goal)
+  dot = dot_raw.abs().clamp(0.0, 1.0)
+  nearly_parallel = dot > (1.0 - 1e-4)
+  # Keep acos argument strictly away from +-1 even in the masked-out branch so
+  # reverse-mode autograd never differentiates acos at |x|=1.
+  safe_dot = torch.where(nearly_parallel, torch.zeros_like(dot), dot).clamp(0.0, 1.0 - 1e-4)
+  theta = torch.acos(safe_dot)
+  sin_theta = torch.sin(theta).clamp(min=1e-6)
+  start_weight = torch.sin((1.0 - weight) * theta) / sin_theta
+  goal_weight = torch.sin(weight * theta) / sin_theta
+  blended = start_weight * start + goal_weight * goal_aligned
+  linear = (1.0 - weight) * start + weight * goal_aligned
   output = torch.where(nearly_parallel, linear, blended)
   output = output / output.norm(dim=-1, keepdim=True).clamp(min=1e-8)
   if make_unique:
@@ -450,37 +464,41 @@ def advance_ee_traj_state(
 ) -> tuple[torch.Tensor, torch.Tensor]:
   """Deterministically advance 20D EE trajectory state by ``dt`` seconds.
 
-  Shared by both ``WbcEePoseCommand`` and imagination rollouts so trajectory
-  evolution requires zero extra random draws and matches bitwise.
-
-  Args:
-    traj_state: Tensor of shape ``(..., 20)``.
-    dt: Scalar step or tensor broadcastable to ``traj_state[..., 0]``.
-    make_quat_unique: Canonicalize output quaternions to ``qw >= 0``.
-
-  Returns:
-    ``(next_traj_state, ee_pose_cmd_7d)`` where ``ee_pose_cmd_7d`` is
-    ``[x_link0, y_link0, z_w, qw, qx, qy, qz]`` in ``WXYZ`` order.
+  Supports arbitrary leading dimensions ``(..., 20)`` including 1D ``(20,)``.
+  Handles ``duration <= 0`` by immediately settling at the goal without jumps,
+  and preserves quaternion sign continuity across trajectory completion even
+  when ``make_quat_unique=False``.
   """
   p0, p1, p2, q0, q1, elapsed, duration, is_traj = unpack_ee_traj_state(traj_state)
   dt_tensor = torch.as_tensor(dt, device=traj_state.device, dtype=traj_state.dtype)
   active = is_traj > 0.5
+  nonpositive_dur = duration <= 0.0
 
   elapsed_next = torch.where(active, elapsed + dt_tensor, elapsed)
-  progress = (elapsed_next / duration.clamp(min=1e-6)).clamp(0.0, 1.0)
+  safe_dur = torch.where(nonpositive_dur, torch.ones_like(duration), duration)
+  raw_progress = (elapsed_next / safe_dur).clamp(0.0, 1.0)
+  progress = torch.where(nonpositive_dur, torch.ones_like(raw_progress), raw_progress)
   curve_s = quintic_smoothstep(progress)
 
   traj_pos = quadratic_bezier(p0, p1, p2, curve_s)
   traj_quat = slerp_wxyz(q0, q1, curve_s, make_unique=make_quat_unique)
 
-  static_quat = quat_unique(q1) if make_quat_unique else q1
-  pos = torch.where(active.unsqueeze(-1), traj_pos, p2)
-  quat = torch.where(active.unsqueeze(-1), traj_quat, static_quat)
+  # Align goal hemisphere to q0 so completed trajectories keep sign continuity
+  # when make_quat_unique=False.
+  dot_q0_q1 = torch.sum(q0 * q1, dim=-1, keepdim=True)
+  q1_aligned = torch.where(dot_q0_q1 < 0.0, -q1, q1)
+  q1_next = torch.where(active[..., None], q1_aligned, q1)
+  static_quat = quat_unique(q1_next) if make_quat_unique else q1_next
 
-  still_active = active & (elapsed_next < duration)
-  next_is_traj = torch.where(still_active, torch.ones_like(is_traj), torch.zeros_like(is_traj))
+  pos = torch.where(active[..., None], traj_pos, p2)
+  quat = torch.where(active[..., None], traj_quat, static_quat)
+
+  still_active = active & (~nonpositive_dur) & (elapsed_next < duration)
+  next_is_traj = torch.where(
+    still_active, torch.ones_like(is_traj), torch.zeros_like(is_traj)
+  )
   next_state = pack_ee_traj_state(
-    p0, p1, p2, q0, q1, elapsed_next, duration, next_is_traj
+    p0, p1, p2, q0, q1_next, elapsed_next, duration, next_is_traj
   )
   cmd_7d = torch.cat((pos, quat), dim=-1)
   return next_state, cmd_7d
@@ -494,9 +512,9 @@ def advance_ee_traj_state(
 class WbcEePoseCommand(CommandTerm):
   """Mixed-frame 7D EE pose command ``[x_link0, y_link0, z_w, qw, qx, qy, qz]`` (WXYZ).
 
-  Supports Stage 1 (±20° attitude cap, step commands only) and Stage 2
-  (wide attitude ±100°/±65°/±35° with 40% quintic Bezier + SLERP trajectories),
-  ``LINK0_BODY_BOX`` collision rejection, and curriculum interpolation.
+  Defers reset-time resampling until the post-``sim.forward()`` ``compute()``
+  call so ``link0`` poses and ``LINK0_BODY_BOX`` checks never observe stale
+  pre-reset transforms.
   """
 
   cfg: WbcEePoseCommandCfg
@@ -522,6 +540,9 @@ class WbcEePoseCommand(CommandTerm):
       torch.arange(self.num_envs, device=self.device, dtype=torch.long),
       self.pose_command[:, :3],
       self.pose_command[:, 3:7],
+    )
+    self._pending_reset = torch.zeros(
+      self.num_envs, dtype=torch.bool, device=self.device
     )
     self._pending_step_dt: float | torch.Tensor | None = None
     self.metrics["position_error"] = torch.zeros(self.num_envs, device=self.device)
@@ -588,14 +609,33 @@ class WbcEePoseCommand(CommandTerm):
     self.metrics["orientation_error"] = torch.norm(rot_error, dim=-1)
 
   def reset(self, env_ids: torch.Tensor | slice | None = None) -> dict[str, float]:
+    """Clear trajectory state and defer resampling until post-forward compute()."""
     ids = self._index_env_ids(env_ids)
+    extras: dict[str, float] = {}
+    for metric_name, metric_value in self.metrics.items():
+      extras[metric_name] = torch.mean(metric_value[ids]).item()
+      metric_value[ids] = 0.0
+    self.command_counter[ids] = 0
     nominal = self._nominal_pose(ids.shape[0])
     self._commit_pose(ids, nominal[:, :3], nominal[:, 3:7])
-    return super().reset(ids)
+    self._pending_reset[ids] = True
+    return extras
 
   def compute(
     self, dt: float | torch.Tensor, env_ids: torch.Tensor | None = None
   ) -> None:
+    """Flush pending post-reset resamples (post-forward) and advance active trajectories."""
+    if bool(torch.any(self._pending_reset)):
+      if env_ids is None:
+        pending_ids = self._pending_reset.nonzero(as_tuple=False).flatten()
+      else:
+        scope = torch.zeros_like(self._pending_reset)
+        scope[env_ids] = True
+        pending_ids = (self._pending_reset & scope).nonzero(as_tuple=False).flatten()
+      if pending_ids.numel() > 0:
+        self._pending_reset[pending_ids] = False
+        self._resample(pending_ids)
+
     self._pending_step_dt = dt
     try:
       super().compute(dt, env_ids)
@@ -962,6 +1002,13 @@ class WbcEePoseCommandCfg(CommandTermCfg):
   def __post_init__(self) -> None:
     if self.stage not in (1, 2):
       raise ValueError(f"stage must be 1 or 2, got {self.stage}")
+    if (
+      self.trajectory_duration_range[0] <= 0.0
+      or self.trajectory_duration_range[1] < self.trajectory_duration_range[0]
+    ):
+      raise ValueError(
+        f"trajectory_duration_range must satisfy 0 < min <= max, got {self.trajectory_duration_range}"
+      )
     if self.ori_abs_max is None:
       self.ori_abs_max = STAGE1_ORI_ABS_MAX if self.stage == 1 else STAGE2_ORI_ABS_MAX
     if self.trajectory_mode_prob is None:
