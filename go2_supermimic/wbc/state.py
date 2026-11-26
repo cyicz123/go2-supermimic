@@ -1,8 +1,8 @@
-﻿"""Whole-body control (WBC) 82D state, analytic differentiable 6-DoF Piper FK,
+"""Whole-body control (WBC) 82D state, analytic differentiable 6-DoF Piper FK,
 210D differentiable observation reconstruction, and 9D DR context reader.
 
 World-model state ``s`` (82D, translation- and yaw-invariant):
-  [0:1]   Z      base height above ground [m]
+  [0:1]   Z      base height above ground under base: ``base_z_w - ground_h(base_xy)`` [m]
   [1:4]   GRAV   projected gravity in body frame
   [4:7]   V_YAW  base linear velocity in the yaw frame [m/s]
   [7:10]  W_B    base angular velocity in body frame [rad/s]
@@ -12,11 +12,15 @@ World-model state ``s`` (82D, translation- and yaw-invariant):
   [58:70] KNEES  FR/FL/RR/RL knee (calf) positions relative to base in yaw frame (4x3)
   [70:82] FEET   FR/FL/RR/RL foot site positions relative to base in yaw frame (4x3)
 
-``HIPS``, ``KNEES``, and ``FEET`` follow the exact convention of
-``go2_supermimic.supermimic.state``: world-frame offsets relative to the robot
-base ``root_link_pos_w``, rotated into the robot yaw frame via
-``yaw_rotate_inverse(..., heading)``. Planar pose ``(x, y, yaw)`` is tracked
-separately via 3D deltas ``(dx_yaw, dy_yaw, dyaw)``.
+Coordinate conventions (matching ``go2_supermimic.supermimic.state``):
+  - ``s[..., Z]`` stores base height *above the terrain directly under the base*
+    (``base_z_w - ground_h(base_xy)``). To recover true world Z on non-flat terrain,
+    add ``ground_z = ground(pose[..., :2], field)``.
+  - ``HIPS``, ``KNEES``, and ``FEET`` store ``p_limb_w - p_base_w`` rotated into
+    the base yaw frame. Thus ``s[..., FEET][..., 2] == z_foot_w - z_base_w``.
+    On non-flat terrain, pass ``ground_z`` to ``wbc_foot_positions_w``,
+    ``wbc_limb_points_world``, ``wbc_feet_world_z``, and ``ee_world_height`` to
+    obtain exact world-frame Z coordinates.
 """
 
 from __future__ import annotations
@@ -28,6 +32,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import NamedTuple
 
+import mujoco
 import numpy as np
 import torch
 
@@ -80,6 +85,13 @@ HIP_BODIES: tuple[str, ...] = tuple(f"{leg}_thigh" for leg in LEGS)
 KNEE_BODIES: tuple[str, ...] = tuple(f"{leg}_calf" for leg in LEGS)
 FOOT_RADIUS: float = 0.022
 
+PIPER_COLLISION_LINK_GEOMS: tuple[tuple[str, str], ...] = (
+  ("link4", "link4_collision"),
+  ("link5", "link5_collision"),
+  ("link6", "link6_collision"),
+  ("end_effector", "end_effector_collision"),
+)
+
 # Observation noise half-widths applied BEFORE term scaling (matching mjlab
 # ObservationManager.compute_group and wbc/env_cfg.py).
 WBC_OBS_NOISE: dict[str, float] = {
@@ -117,21 +129,80 @@ _FRAME_TERM_SLICES: tuple[tuple[str, int, slice], ...] = tuple(
 ##
 
 
-def wbc_feet_world_z(s: torch.Tensor) -> torch.Tensor:
-  """World-frame foot site heights ``(..., 4)`` above ground from 82D state ``s``."""
-  return s[..., Z] + s[..., FEET].reshape(*s.shape[:-1], 4, 3)[..., 2]
+def _resolve_base_world_z(
+  base_z_rel: torch.Tensor,
+  ground_z: torch.Tensor | float | None,
+  lead_shape: tuple[int, ...],
+) -> torch.Tensor:
+  """Add optional ``ground_z`` to ``base_z_rel`` ``(..., 1)`` -> ``(..., 1)``."""
+  if ground_z is None:
+    return base_z_rel
+  gz = torch.as_tensor(ground_z, device=base_z_rel.device, dtype=base_z_rel.dtype)
+  if gz.ndim == len(lead_shape):
+    gz = gz.unsqueeze(-1)
+  elif gz.ndim == 0:
+    gz = gz.view(*([1] * len(lead_shape)), 1)
+  return base_z_rel + gz
 
 
-def wbc_limb_points_world(s: torch.Tensor, pose: torch.Tensor) -> dict[str, torch.Tensor]:
-  """World-frame hips, knees, and feet (each ``(N, 4, 3)``) from 82D state and planar pose."""
-  c, si = pose[:, 2].cos(), pose[:, 2].sin()
-  base = torch.cat([pose[:, :2], s[:, Z]], dim=-1).unsqueeze(1)
+def _yaw_rel_to_world_points(
+  rel_yaw: torch.Tensor,
+  pose: torch.Tensor,
+  base_z_w: torch.Tensor,
+) -> torch.Tensor:
+  """Transform yaw-frame limb offsets ``(..., 4, 3)`` into world 3D coordinates ``(..., 4, 3)``."""
+  yaw = pose[..., 2]
+  c = yaw.cos().unsqueeze(-1)
+  si = yaw.sin().unsqueeze(-1)
+  x = c * rel_yaw[..., 0] - si * rel_yaw[..., 1]
+  y = si * rel_yaw[..., 0] + c * rel_yaw[..., 1]
+  base = torch.cat([pose[..., :2], base_z_w], dim=-1).unsqueeze(-2)
+  return base + torch.stack([x, y, rel_yaw[..., 2]], dim=-1)
+
+
+def wbc_feet_world_z(
+  s: torch.Tensor, ground_z: torch.Tensor | float | None = None
+) -> torch.Tensor:
+  """World-frame foot site heights ``(..., 4)`` from 82D state ``s``.
+
+  ``s[..., Z]`` is base height above ground under the base; pass ``ground_z``
+  (terrain height under ``pose[..., :2]``) on non-flat terrain for true world Z.
+  """
+  lead_shape = s.shape[:-1]
+  base_z_w = _resolve_base_world_z(s[..., Z], ground_z, lead_shape)
+  return base_z_w + s[..., FEET].reshape(*lead_shape, 4, 3)[..., 2]
+
+
+def wbc_foot_positions_w(
+  s: torch.Tensor,
+  pose: torch.Tensor,
+  ground_z: torch.Tensor | float | None = None,
+) -> torch.Tensor:
+  """Differentiable world-frame 3D positions ``(..., 4, 3)`` of the 4 feet.
+
+  Reconstructs exact world coordinates from ``s[..., Z]``, ``s[..., FEET]``,
+  planar ``pose=(x, y, yaw)``, and ``ground_z=ground(pose[..., :2], field)`` so
+  finite-difference foot velocities match world-frame simulation velocities even
+  over non-zero or varying terrain heights.
+  """
+  lead_shape = s.shape[:-1]
+  base_z_w = _resolve_base_world_z(s[..., Z], ground_z, lead_shape)
+  rel_feet = s[..., FEET].reshape(*lead_shape, 4, 3)
+  return _yaw_rel_to_world_points(rel_feet, pose, base_z_w)
+
+
+def wbc_limb_points_world(
+  s: torch.Tensor,
+  pose: torch.Tensor,
+  ground_z: torch.Tensor | float | None = None,
+) -> dict[str, torch.Tensor]:
+  """World-frame hips, knees, and feet (each ``(..., 4, 3)``) from 82D state and planar pose."""
+  lead_shape = s.shape[:-1]
+  base_z_w = _resolve_base_world_z(s[..., Z], ground_z, lead_shape)
   out: dict[str, torch.Tensor] = {}
   for name, sl in (("hips", HIPS), ("knees", KNEES), ("feet", FEET)):
-    rel = s[:, sl].reshape(-1, 4, 3)
-    x = c.unsqueeze(-1) * rel[..., 0] - si.unsqueeze(-1) * rel[..., 1]
-    y = si.unsqueeze(-1) * rel[..., 0] + c.unsqueeze(-1) * rel[..., 1]
-    out[name] = base + torch.stack([x, y, rel[..., 2]], dim=-1)
+    rel = s[..., sl].reshape(*lead_shape, 4, 3)
+    out[name] = _yaw_rel_to_world_points(rel, pose, base_z_w)
   return out
 
 
@@ -176,33 +247,35 @@ def wbc_robot_consts(env) -> WbcRobotConsts:
     else:
       raise KeyError(f"no actuator for joint {n}")
   dev = env.device
-  scale = term._scale
-  if not torch.is_tensor(scale):
-    scale = torch.full((env.num_envs, WBC_NUM_JOINTS), float(scale), device=dev)
-  else:
-    scale = scale.clone()
-  default_q = robot.data.default_joint_pos.clone()
-  joint_limits = robot.data.joint_pos_limits.clone()
-  soft_limits = robot.data.soft_joint_pos_limits.clone()
-  arm_idx = torch.arange(WBC_NUM_LEG_JOINTS, WBC_NUM_JOINTS, device=dev, dtype=torch.long)
   max_arm_delta = float(term.cfg.max_arm_vel) * float(term.cfg.policy_dt)
-  clip = getattr(term, "_clip", None)
-  return WbcRobotConsts(
-    default_q=default_q,
-    action_scale=scale,
-    kp=torch.tensor(kp, device=dev, dtype=torch.float32),
-    kd=torch.tensor(kd, device=dev, dtype=torch.float32),
-    effort=torch.tensor(eff, device=dev, dtype=torch.float32),
-    soft_limits=soft_limits,
-    joint_limits=joint_limits,
-    arm_indices=arm_idx,
-    default_arm=default_q[:, arm_idx],
-    scale_arm=scale[:, arm_idx],
-    arm_lower=joint_limits[:, arm_idx, 0],
-    arm_upper=joint_limits[:, arm_idx, 1],
-    max_arm_delta=max_arm_delta,
-    action_clip=clip.clone() if torch.is_tensor(clip) else None,
-  )
+  with torch.inference_mode(False):
+    scale = term._scale
+    if not torch.is_tensor(scale):
+      scale = torch.full((env.num_envs, WBC_NUM_JOINTS), float(scale), device=dev)
+    else:
+      scale = scale.detach().clone()
+    default_q = robot.data.default_joint_pos.detach().clone()
+    joint_limits = robot.data.joint_pos_limits.detach().clone()
+    soft_limits = robot.data.soft_joint_pos_limits.detach().clone()
+    arm_idx = torch.arange(WBC_NUM_LEG_JOINTS, WBC_NUM_JOINTS, device=dev, dtype=torch.long)
+    clip = getattr(term, "_clip", None)
+    clip_t = clip.detach().clone() if torch.is_tensor(clip) else None
+    return WbcRobotConsts(
+      default_q=default_q,
+      action_scale=scale,
+      kp=torch.tensor(kp, device=dev, dtype=torch.float32),
+      kd=torch.tensor(kd, device=dev, dtype=torch.float32),
+      effort=torch.tensor(eff, device=dev, dtype=torch.float32),
+      soft_limits=soft_limits,
+      joint_limits=joint_limits,
+      arm_indices=arm_idx,
+      default_arm=default_q[:, arm_idx],
+      scale_arm=scale[:, arm_idx],
+      arm_lower=joint_limits[:, arm_idx, 0],
+      arm_upper=joint_limits[:, arm_idx, 1],
+      max_arm_delta=max_arm_delta,
+      action_clip=clip_t,
+    )
 
 
 _WBC_LIMB_IDS: dict[int, tuple[list[int], list[int], list[int]]] = {}
@@ -285,7 +358,8 @@ class _PiperChainData:
   joint_axis: tuple[tuple[float, float, float], ...]  # joint1..joint6 (6)
   link6_to_ee_pos: tuple[float, float, float]
   link6_to_ee_quat: tuple[float, float, float, float]
-  ee_sphere_pos_in_ee: tuple[float, float, float]
+  collision_local_centers: dict[str, tuple[float, float, float]]
+  collision_radii: dict[str, float]
 
 
 def _parse_vec(text: str | None, default: tuple[float, ...]) -> np.ndarray:
@@ -334,7 +408,7 @@ def _invert_transform_np(p: np.ndarray, q: np.ndarray) -> tuple[np.ndarray, np.n
 
 @lru_cache(maxsize=4)
 def _load_piper_chain(xml_path: str = str(GO2_PIPER_XML)) -> _PiperChainData:
-  """Parse exact fixed transforms & joint axes along base->link0->link1..6->end_effector."""
+  """Parse exact fixed transforms, joint axes, and compiled collision geom centers."""
   tree = ET.parse(Path(xml_path))
   root = tree.getroot()
   base_body = root.find(".//body[@name='base']")
@@ -396,22 +470,33 @@ def _load_piper_chain(xml_path: str = str(GO2_PIPER_XML)) -> _PiperChainData:
     p_es = _parse_vec(ee_site.attrib.get("pos"), (0.0, 0.0, 0.0))
     q_es = _norm_quat_np(_parse_vec(ee_site.attrib.get("quat"), (1.0, 0.0, 0.0, 0.0)))
     p_l6_to_ee, q_l6_to_ee = _compose_transform_np(p_ee, q_ee, p_es, q_es)
-    p_ee_site_to_body, _ = _invert_transform_np(p_es, q_es)
+    p_ee_site_to_body, q_ee_site_to_body = _invert_transform_np(p_es, q_es)
   else:
     p_l6_to_ee, q_l6_to_ee = p_ee, q_ee
     p_ee_site_to_body = np.zeros(3, dtype=np.float64)
+    q_ee_site_to_body = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
 
-  ee_col = ee_body.find("geom[@name='end_effector_collision']")
-  p_ee_sphere_body = (
-    _parse_vec(ee_col.attrib.get("pos"), (0.0, 0.0, 0.0))
-    if ee_col is not None
-    else np.zeros(3, dtype=np.float64)
-  )
-  p_ee_sphere = p_ee_site_to_body + (
-    _quat_rotate_np(np.array([1.0, 0.0, 0.0, 0.0]), p_ee_sphere_body)
-    if ee_site is None
-    else _quat_rotate_np(_invert_transform_np(np.zeros(3), q_es)[1], p_ee_sphere_body)
-  )
+  # Compile MJCF once to extract MuJoCo's exact mesh/primitive collision geom
+  # centers (model.geom_pos) and bounding radii (model.geom_rbound) per body.
+  mj_model = mujoco.MjSpec.from_file(xml_path).compile()
+  collision_local_centers: dict[str, tuple[float, float, float]] = {}
+  collision_radii: dict[str, float] = {}
+  for link_name, geom_name in PIPER_COLLISION_LINK_GEOMS:
+    gid = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_GEOM, geom_name)
+    bid = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_BODY, link_name)
+    if gid < 0 or bid < 0:
+      raise ValueError(f"Missing geom '{geom_name}' or body '{link_name}' in {xml_path}")
+    if int(mj_model.geom_bodyid[gid]) != bid:
+      raise ValueError(f"Geom '{geom_name}' does not belong to body '{link_name}'")
+    local_pos = np.asarray(mj_model.geom_pos[gid], dtype=np.float64)
+    if link_name == "end_effector":
+      # Transform from end_effector body frame to end_effector site frame.
+      local_pos = p_ee_site_to_body + _quat_rotate_np(q_ee_site_to_body, local_pos)
+    collision_local_centers[link_name] = tuple(float(v) for v in local_pos)
+    if int(mj_model.geom_type[gid]) == int(mujoco.mjtGeom.mjGEOM_SPHERE):
+      collision_radii[link_name] = float(mj_model.geom_size[gid, 0])
+    else:
+      collision_radii[link_name] = float(mj_model.geom_rbound[gid])
 
   return _PiperChainData(
     base_to_link0_pos=tuple(float(v) for v in p_base_to_l0site),
@@ -422,8 +507,14 @@ def _load_piper_chain(xml_path: str = str(GO2_PIPER_XML)) -> _PiperChainData:
     joint_axis=tuple(joint_axis_list),
     link6_to_ee_pos=tuple(float(v) for v in p_l6_to_ee),
     link6_to_ee_quat=tuple(float(v) for v in q_l6_to_ee),
-    ee_sphere_pos_in_ee=tuple(float(v) for v in p_ee_sphere),
+    collision_local_centers=collision_local_centers,
+    collision_radii=collision_radii,
   )
+
+
+def piper_collision_radii(xml_path: str = str(GO2_PIPER_XML)) -> dict[str, float]:
+  """Compiled MuJoCo collision bounding sphere radii for ``link4..end_effector``."""
+  return dict(_load_piper_chain(xml_path).collision_radii)
 
 
 def _quat_mul(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
@@ -461,22 +552,26 @@ def _piper_chain_tensors(
   tuple[torch.Tensor, ...],
   torch.Tensor,
   torch.Tensor,
-  torch.Tensor,
+  dict[str, torch.Tensor],
 ]:
+  """Create cached FK constant tensors outside any outer ``torch.inference_mode()``."""
   chain = _load_piper_chain()
   dev = torch.device(device_str)
-  t = lambda seq: torch.tensor(seq, device=dev, dtype=dtype)  # noqa: E731
-  return (
-    t(chain.base_to_link0_pos),
-    t(chain.base_to_link0_quat),
-    tuple(t(p) for p in chain.link_pos),
-    tuple(t(q) for q in chain.link_quat),
-    tuple(t(jp) for jp in chain.joint_pos),
-    tuple(t(ja) for ja in chain.joint_axis),
-    t(chain.link6_to_ee_pos),
-    t(chain.link6_to_ee_quat),
-    t(chain.ee_sphere_pos_in_ee),
-  )
+  # Always leave inference_mode when constructing cached constants so a first call
+  # inside Trainer.collect()'s inference_mode never poisons later autograd BPTT.
+  with torch.inference_mode(False), torch.no_grad():
+    t = lambda seq: torch.tensor(seq, device=dev, dtype=dtype)  # noqa: E731
+    return (
+      t(chain.base_to_link0_pos),
+      t(chain.base_to_link0_quat),
+      tuple(t(p) for p in chain.link_pos),
+      tuple(t(q) for q in chain.link_quat),
+      tuple(t(jp) for jp in chain.joint_pos),
+      tuple(t(ja) for ja in chain.joint_axis),
+      t(chain.link6_to_ee_pos),
+      t(chain.link6_to_ee_quat),
+      {k: t(v) for k, v in chain.collision_local_centers.items()},
+    )
 
 
 def piper_fk(q_arm: torch.Tensor) -> PiperFkResult:
@@ -485,6 +580,8 @@ def piper_fk(q_arm: torch.Tensor) -> PiperFkResult:
   Uses chained WXYZ quaternion multiplication (zero Shepperd branches, zero
   gimbal/antipodal singularities) and supports arbitrary leading batch
   dimensions ``(..., 6)`` including 1D ``(6,)``, 2D ``(B, 6)``, and 3D ``(T, B, 6)``.
+  ``link_pos_link0`` returns the exact compiled MuJoCo collision geom centers
+  of ``link4``, ``link5``, ``link6``, and ``end_effector`` in the ``link0`` frame.
   """
   if q_arm.shape[-1] != WBC_NUM_ARM_JOINTS:
     raise ValueError(f"Expected q_arm trailing dim 6, got {q_arm.shape[-1]}")
@@ -498,7 +595,7 @@ def piper_fk(q_arm: torch.Tensor) -> PiperFkResult:
     joint_axis,
     p_l6_ee,
     q_l6_ee,
-    p_ee_sphere,
+    col_local_centers,
   ) = _piper_chain_tensors(str(q_arm.device), q_arm.dtype)
 
   lead_shape = q_arm.shape[:-1]
@@ -524,22 +621,23 @@ def piper_fk(q_arm: torch.Tensor) -> PiperFkResult:
     s_i = sin_h[..., idx : idx + 1]
     q_joint = torch.cat([c_i, axis_i * s_i], dim=-1)
 
-    if idx in (3, 4, 5):
-      # Link body origin (coincident with joint pivot when j_pos_i == 0).
-      link_pos_link0[f"link{idx + 1}"] = p
-
     # Rotate around joint pivot j_pos_i in link_i frame (no-op when j_pos_i == 0).
     p = p + _quat_rotate(q, j_pos_i)
     q = _quat_mul(q, q_joint)
     p = p - _quat_rotate(q, j_pos_i)
+
+    link_name = f"link{idx + 1}"
+    if link_name in col_local_centers:
+      local_c = col_local_centers[link_name].expand(*lead_shape, 3)
+      link_pos_link0[link_name] = p + _quat_rotate(q, local_c)
 
   p_ee_link0 = p + _quat_rotate(q, p_l6_ee.expand(*lead_shape, 3))
   q_ee_link0 = _quat_mul(q, q_l6_ee.expand(*lead_shape, 4))
   q_ee_norm = torch.sqrt((q_ee_link0 * q_ee_link0).sum(dim=-1, keepdim=True) + 1e-16)
   q_ee_link0 = q_ee_link0 / q_ee_norm
 
-  p_ee_sphere_link0 = p_ee_link0 + _quat_rotate(q_ee_link0, p_ee_sphere.expand(*lead_shape, 3))
-  link_pos_link0["end_effector"] = p_ee_sphere_link0
+  p_ee_col_local = col_local_centers["end_effector"].expand(*lead_shape, 3)
+  link_pos_link0["end_effector"] = p_ee_link0 + _quat_rotate(q_ee_link0, p_ee_col_local)
 
   p_ee_base = p_base_l0.expand(*lead_shape, 3) + _quat_rotate(
     q_base_l0.expand(*lead_shape, 4), p_ee_link0
@@ -553,17 +651,29 @@ def piper_fk(q_arm: torch.Tensor) -> PiperFkResult:
 
 
 def ee_world_height(
-  base_z: torch.Tensor, grav_b: torch.Tensor, p_ee_base: torch.Tensor
+  base_z: torch.Tensor,
+  grav_b: torch.Tensor,
+  p_ee_base: torch.Tensor,
+  ground_z: torch.Tensor | float | None = None,
 ) -> torch.Tensor:
   """Yaw-invariant, singularity-free EE world height from ``base_z``, ``grav_b``, ``p_ee_base``.
 
-  Supports arbitrary leading dimensions ``(...,)`` or ``(..., 1)`` for ``base_z``
-  and ``(..., 3)`` for ``grav_b`` and ``p_ee_base``.
+  ``base_z`` is base height above the ground under the base (``s[..., Z]``).
+  Pass ``ground_z`` (terrain height under ``pose[..., :2]``) on non-flat terrain
+  so ``base_z_w = base_z + ground_z`` and the returned height is in world Z.
+  Supports arbitrary leading dimensions ``(...,)`` or ``(..., 1)`` for
+  ``base_z`` and ``ground_z``.
   """
   if base_z.ndim == p_ee_base.ndim and base_z.shape[-1] == 1:
     base_z = base_z.squeeze(-1)
+  base_z_w = base_z
+  if ground_z is not None:
+    gz = torch.as_tensor(ground_z, device=p_ee_base.device, dtype=p_ee_base.dtype)
+    if gz.ndim == p_ee_base.ndim and gz.shape[-1] == 1:
+      gz = gz.squeeze(-1)
+    base_z_w = base_z_w + gz
   g_hat = grav_b / torch.sqrt((grav_b * grav_b).sum(dim=-1, keepdim=True) + 1e-8)
-  return base_z + ((-g_hat) * p_ee_base).sum(dim=-1)
+  return base_z_w + ((-g_hat) * p_ee_base).sum(dim=-1)
 
 
 ##
@@ -653,7 +763,6 @@ def wbc_obs_frame(
   actions = a_prev_raw
   if consts is not None and consts.action_clip is not None:
     clip = consts.action_clip
-    # Support arbitrary leading dims when consts comes from a batched env.
     c_lo = clip[0, :, 0]
     c_hi = clip[0, :, 1]
     actions = torch.clamp(actions, min=c_lo, max=c_hi)
@@ -734,30 +843,30 @@ class WbcContextReader:
     robot = env.scene["robot"]
     local_geoms, _ = robot.find_geoms(FOOT_GEOM_NAMES, preserve_order=True)
     local_body, _ = robot.find_bodies("base")
-    self.foot_geoms = robot.indexing.geom_ids[local_geoms].to(dtype=torch.long)
     self.base_body = int(robot.indexing.body_ids[local_body[0]])
-
     mj_model = env.sim.mj_model
-    self.base_ipos0 = torch.as_tensor(
-      mj_model.body_ipos[self.base_body], device=env.device, dtype=torch.float32
-    ).clone()
     self.base_mass0 = float(mj_model.body_mass[self.base_body])
 
     leg_set = set(LEG_JOINT_NAMES)
     arm_set = set(ARM_JOINT_NAMES)
     self._leg_actuators: list[tuple[object, torch.Tensor]] = []
     self._arm_actuators: list[tuple[object, torch.Tensor]] = []
-    for act in robot.actuators:
-      leg_idx = [i for i, n in enumerate(act.target_names) if n in leg_set]
-      arm_idx = [i for i, n in enumerate(act.target_names) if n in arm_set]
-      if leg_idx:
-        self._leg_actuators.append(
-          (act, torch.tensor(leg_idx, device=env.device, dtype=torch.long))
-        )
-      if arm_idx:
-        self._arm_actuators.append(
-          (act, torch.tensor(arm_idx, device=env.device, dtype=torch.long))
-        )
+    with torch.inference_mode(False):
+      self.foot_geoms = robot.indexing.geom_ids[local_geoms].detach().to(dtype=torch.long).clone()
+      self.base_ipos0 = torch.as_tensor(
+        mj_model.body_ipos[self.base_body], device=env.device, dtype=torch.float32
+      ).clone()
+      for act in robot.actuators:
+        leg_idx = [i for i, n in enumerate(act.target_names) if n in leg_set]
+        arm_idx = [i for i, n in enumerate(act.target_names) if n in arm_set]
+        if leg_idx:
+          self._leg_actuators.append(
+            (act, torch.tensor(leg_idx, device=env.device, dtype=torch.long))
+          )
+        if arm_idx:
+          self._arm_actuators.append(
+            (act, torch.tensor(arm_idx, device=env.device, dtype=torch.long))
+          )
     if not self._leg_actuators or not self._arm_actuators:
       raise RuntimeError("Missing leg or arm actuators on robot entity.")
 
