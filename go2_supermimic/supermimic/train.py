@@ -130,6 +130,7 @@ class TrainCfg:
   seed: int = 0
   run_name: str = "supermimic"
   log_root: str = "logs/supermimic"
+  wbc_stage: int = 1
 
 
 class Actor(nn.Module):
@@ -640,8 +641,20 @@ class Trainer:
 
 
 def main() -> None:
+  pre = argparse.ArgumentParser(add_help=False)
+  pre.add_argument("--task", type=str, default=TrainCfg.task)
+  pre_args, _ = pre.parse_known_args()
+  is_wbc = pre_args.task.startswith("Go2Piper-WBC")
+  if is_wbc:
+    from go2_supermimic.wbc.trainer import WbcTrainCfg, WbcTrainer
+
+    defaults: TrainCfg = WbcTrainCfg()
+    cfg_cls: type[TrainCfg] = WbcTrainCfg
+  else:
+    defaults = TrainCfg()
+    cfg_cls = TrainCfg
+
   ap = argparse.ArgumentParser()
-  defaults = TrainCfg()
   for name, val in asdict(defaults).items():
     if isinstance(val, tuple):
       ap.add_argument(f"--{name.replace('_', '-')}", type=int, nargs="+", default=list(val))
@@ -651,8 +664,11 @@ def main() -> None:
     else:
       ap.add_argument(f"--{name.replace('_', '-')}", type=type(val), default=val)
   args = vars(ap.parse_args())
-  cfg = TrainCfg(**{k: tuple(v) if isinstance(v, list) else v for k, v in args.items()})
-  Trainer(cfg).run()
+  cfg = cfg_cls(**{k: tuple(v) if isinstance(v, list) else v for k, v in args.items()})
+  if is_wbc:
+    WbcTrainer(cfg).run()
+  else:
+    Trainer(cfg).run()
 
 
 if __name__ == "__main__":

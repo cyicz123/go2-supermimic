@@ -22,7 +22,6 @@ from mjlab.terrains.terrain_generator import TerrainGeneratorCfg
 from mjlab.utils.noise import UniformNoiseCfg as Unoise
 from mjlab.viewer import ViewerConfig
 
-from go2_supermimic.env.terrains import clean_look
 from go2_supermimic.robot.go2_piper import (
   ACTION_SCALE,
   CANONICAL_JOINT_NAMES,
@@ -120,6 +119,8 @@ def _quiet_solver_warnings(env: ManagerBasedRlEnv, env_ids: torch.Tensor | None)
 
 
 def _micro_rough_terrain() -> TerrainEntityCfg:
+  from go2_supermimic.env.terrains import clean_look
+
   """Gentle random micro-roughness terrain (1-2 cm amplitude) for Stage 2 robustness."""
   gen = TerrainGeneratorCfg(
     seed=11,
@@ -160,6 +161,8 @@ def go2_piper_wbc_env_cfg(
   """
   if stage not in (1, 2):
     raise ValueError(f"stage must be 1 or 2, got {stage}")
+
+  from go2_supermimic.env.terrains import clean_look
 
   terrain_cfg = (
     _micro_rough_terrain()
