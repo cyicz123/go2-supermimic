@@ -592,6 +592,69 @@ def test_delayed_pd_partial_reset_preserves_unreset_delay_queue_and_velocity_lim
       f"Exceeded velocity limit: max_excess={(v_entity.data.joint_vel.abs() - vel_limits[None, :]).max().item()}"
     )
 
+  # Regression 4 (Codex Round 4 probe): joint6 at default pose with initial vel=3.0 rad/s
+  # and full 9.5844 Nm effort must integrate at most v_lim*dt per substep (<= 0.015 rad in 5 ms,
+  # <= 0.060 rad in 20 ms / 4 substeps), AND partial reset must NOT pull reset env back to old qpos_prev.
+  cfg_j6 = get_go2_piper_robot_cfg(leg_delay=(0, 0), arm_delay=(0, 0))
+  j6_entity = Entity(cfg_j6)
+  j6_model = j6_entity.spec.compile()
+  j6_sim = Simulation(
+    num_envs=2,
+    cfg=SimulationCfg(mujoco=MujocoCfg(timestep=0.005)),
+    model=j6_model,
+    device="cpu",
+  )
+  j6_entity.initialize(j6_model, j6_sim.model, j6_sim.data, "cpu")
+  j6_sim.reset()
+  j6_entity.reset()
+
+  j6_dof = 17  # canonical index of joint6
+  j6_ctrl = int(j6_entity.actuators[7].global_ctrl_ids[0])
+  qpos_j6 = j6_entity.data.default_joint_pos.clone()
+  qvel_j6 = torch.zeros(2, 18)
+  qvel_j6[:, j6_dof] = 3.0
+  j6_entity.write_joint_state_to_sim(qpos_j6, qvel_j6)
+  j6_sim.forward()
+
+  tgt_j6 = j6_entity.data.default_joint_pos.clone()
+  tgt_j6[:, j6_dof] = 2.0  # drives full 9.5844 Nm positive torque
+  q0_j6 = j6_entity.data.joint_pos[:, j6_dof].clone()
+
+  for step in range(4):
+    j6_entity.set_joint_position_target(tgt_j6)
+    j6_entity.write_data_to_sim()
+    assert float(j6_sim.data.ctrl[0, j6_ctrl]) == pytest.approx(ARM_EFFORT_LIMIT[5], abs=1e-4)
+    j6_sim.step()
+    j6_entity.update(0.005)
+    assert bool((j6_entity.data.joint_vel[:, j6_dof].abs() <= 3.0 + 1e-6).all())
+    if step == 0:
+      dq_1 = (j6_entity.data.joint_pos[:, j6_dof] - q0_j6).abs()
+      assert bool((dq_1 <= 3.0 * 0.005 + 1e-5).all()), f"1-step dq exceeded 0.015: {dq_1}"
+
+  dq_4 = (j6_entity.data.joint_pos[:, j6_dof] - q0_j6).abs()
+  assert bool((dq_4 <= 3.0 * 0.02 + 1e-5).all()), f"4-step dq exceeded 0.060: {dq_4}"
+
+  # Partial reset env 0 to a far pose (-1.2 rad) after old episode reached +0.06 rad;
+  # verify first post-reset step does NOT pull env 0 back toward old qpos_prev.
+  p0 = torch.tensor([0], dtype=torch.long)
+  j6_sim.reset(p0)
+  j6_entity.reset(p0)
+  new_q = j6_entity.data.default_joint_pos.clone()
+  new_q[0, j6_dof] = -1.2
+  new_v = torch.zeros(2, 18)
+  new_v[0, j6_dof] = 3.0
+  j6_entity.write_joint_state_to_sim(new_q[0:1], new_v[0:1], env_ids=p0)
+  j6_sim.forward()
+  tgt_reset = tgt_j6.clone()
+  tgt_reset[0, j6_dof] = 1.0  # saturated +9.5844 Nm from -1.2 rad at vel=+3.0
+  j6_entity.set_joint_position_target(tgt_reset)
+  j6_entity.write_data_to_sim()
+  j6_sim.step()
+  j6_entity.update(0.005)
+  dq_after_reset = float(j6_entity.data.joint_pos[0, j6_dof] - (-1.2))
+  assert abs(dq_after_reset) <= 3.0 * 0.005 + 1e-5, f"Reset env pulled/overshot: {dq_after_reset}"
+  assert float(j6_entity.data.joint_pos[0, j6_dof]) < -1.15
+
 
 # ---------------------------------------------------------------------------
 # 3. 50 Hz Piper slew-rate action tests (immediate q_ref_arm sync on reset)

@@ -101,6 +101,11 @@ class DelayedPdActuator(IdealPdActuator["DelayedPdActuatorCfg"]):
     super().__init__(cfg, entity, target_ids, target_names)
     self.velocity_limit: torch.Tensor | None = None
     self._joint_v_adrs: torch.Tensor | None = None
+    self._joint_q_adrs: torch.Tensor | None = None
+    self._joint_q_min: torch.Tensor | None = None
+    self._joint_q_max: torch.Tensor | None = None
+    self._qpos_prev: torch.Tensor | None = None
+    self._qpos_prev_time: torch.Tensor | None = None
     self._lags: torch.Tensor | None = None
     self._history_len: int = 0
     self._cmd_history: torch.Tensor | None = None
@@ -129,6 +134,11 @@ class DelayedPdActuator(IdealPdActuator["DelayedPdActuatorCfg"]):
     assert self.stiffness is not None
     assert self.damping is not None
     assert self.force_limit is not None
+    if self._qpos_prev is not None and self._qpos_prev_time is not None:
+      # Capture pre-substep joint positions so update(dt) can align position integration
+      # with velocity_limit_sim when sim.step() overshoots velocity bounds mid-step.
+      self._qpos_prev.copy_(cmd.pos)
+      self._qpos_prev_time.copy_(self.entity.data.data.time)
     params = {
       "stiffness": self.stiffness,
       "damping": self.damping,
@@ -173,12 +183,36 @@ class DelayedPdActuator(IdealPdActuator["DelayedPdActuatorCfg"]):
     ):
       assert self._target_ids is not None
       self._joint_v_adrs = self.entity.indexing.joint_v_adr[self._target_ids]
+      self._joint_q_adrs = self.entity.indexing.joint_q_adr[self._target_ids]
+      mj_jnt_ids = self.entity.indexing.joint_ids[self._target_ids].detach().cpu().tolist()
+      q_mins: list[float] = []
+      q_maxs: list[float] = []
+      for jid in mj_jnt_ids:
+        if mj_model.jnt_limited[jid]:
+          q_mins.append(float(mj_model.jnt_range[jid, 0]))
+          q_maxs.append(float(mj_model.jnt_range[jid, 1]))
+        else:
+          q_mins.append(float("-inf"))
+          q_maxs.append(float("inf"))
+      self._joint_q_min = torch.tensor(q_mins, dtype=torch.float, device=device).unsqueeze(0)
+      self._joint_q_max = torch.tensor(q_maxs, dtype=torch.float, device=device).unsqueeze(0)
       self.velocity_limit = torch.full(
         (num_envs, num_joints), float(self.cfg.velocity_limit), dtype=torch.float, device=device
       )
+      self._qpos_prev = torch.full(
+        (num_envs, num_joints), float("nan"), dtype=torch.float, device=device
+      )
+      self._qpos_prev_time = torch.full(
+        (num_envs,), float("nan"), dtype=data.time.dtype, device=device
+      )
     else:
       self._joint_v_adrs = None
+      self._joint_q_adrs = None
+      self._joint_q_min = None
+      self._joint_q_max = None
       self.velocity_limit = None
+      self._qpos_prev = None
+      self._qpos_prev_time = None
 
     self._lags = torch.zeros(num_envs, dtype=torch.long, device=device)
     if self.has_delay:
@@ -230,20 +264,42 @@ class DelayedPdActuator(IdealPdActuator["DelayedPdActuatorCfg"]):
       effort_target=delayed[..., 2],
     )
 
-  def enforce_velocity_limit(self) -> None:
-    """Clamp controlled joint velocities to ``±velocity_limit`` (``velocity_limit_sim`` parity)."""
+  def enforce_velocity_limit(self, dt: float | None = None) -> None:
+    """Clamp joint velocities and step displacements to ``±velocity_limit`` (``velocity_limit_sim`` parity)."""
     if self.velocity_limit is None or self._joint_v_adrs is None:
       return
-    qvel = self.entity.data.data.qvel
-    cur = qvel[:, self._joint_v_adrs]
+    sim_data = self.entity.data.data
+    qvel = sim_data.qvel
+    raw_qvel = qvel[:, self._joint_v_adrs]
+    vel_exceeded = raw_qvel.abs() > self.velocity_limit
     qvel[:, self._joint_v_adrs] = torch.clamp(
-      cur, min=-self.velocity_limit, max=self.velocity_limit
+      raw_qvel, min=-self.velocity_limit, max=self.velocity_limit
     )
 
+    if (
+      dt is not None
+      and dt > 0.0
+      and self._joint_q_adrs is not None
+      and self._qpos_prev is not None
+      and self._qpos_prev_time is not None
+      and self._joint_q_min is not None
+      and self._joint_q_max is not None
+    ):
+      sim_time = sim_data.time
+      valid_step = torch.isfinite(self._qpos_prev_time) & (sim_time > self._qpos_prev_time)
+      qpos = sim_data.qpos
+      q_new = qpos[:, self._joint_q_adrs]
+      max_dq = self.velocity_limit * float(dt)
+      q_limited = self._qpos_prev + torch.clamp(q_new - self._qpos_prev, min=-max_dq, max=max_dq)
+      q_limited = torch.clamp(q_limited, min=self._joint_q_min, max=self._joint_q_max)
+      q_out = torch.where(valid_step.unsqueeze(-1) & vel_exceeded, q_limited, q_new)
+      qpos[:, self._joint_q_adrs] = q_out
+      self._qpos_prev.copy_(q_out)
+      self._qpos_prev_time.copy_(sim_time)
+
   def update(self, dt: float) -> None:
-    """Enforce simulation-level ``velocity_limit_sim`` after each ``sim.step()``."""
-    del dt
-    self.enforce_velocity_limit()
+    """Enforce simulation-level ``velocity_limit_sim`` (qvel and Δq) after each ``sim.step()``."""
+    self.enforce_velocity_limit(dt=dt)
 
   def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
     if self._lags is None:
@@ -261,6 +317,9 @@ class DelayedPdActuator(IdealPdActuator["DelayedPdActuatorCfg"]):
     if count == 0:
       return
     self._lags[idx] = self._sample_lags(count)
+    if self._qpos_prev is not None and self._qpos_prev_time is not None:
+      self._qpos_prev[idx] = float("nan")
+      self._qpos_prev_time[idx] = float("nan")
     if self.has_delay:
       assert self._cmd_history is not None
       assert self._write_idx is not None
