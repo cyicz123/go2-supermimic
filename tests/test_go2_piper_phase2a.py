@@ -336,11 +336,14 @@ def test_pyproject_package_data_includes_all_go2_piper_assets() -> None:
 
 
 def test_delayed_pd_actuator_constant_effort_and_episode_constant_lag() -> None:
+  torch.manual_seed(42)
   cfg = get_go2_piper_robot_cfg(leg_delay=(1, 4), arm_delay=(3, 9))
   entity = Entity(cfg)
   model = entity.spec.compile()
+  model.opt.timestep = 0.005
 
-  # Check actuator control_law delivers full constant effort_limit at 0, 2.25, 3.0 rad/s.
+  # Check actuator control_law delivers full constant effort_limit at 0 and 2.25 rad/s,
+  # while blocking accelerating torque at +/-velocity_limit (3.0 rad/s).
   arm_act = entity.actuators[2]
   assert isinstance(arm_act, DelayedPdActuator)
   n_envs = 8
@@ -352,47 +355,221 @@ def test_delayed_pd_actuator_constant_effort_and_episode_constant_lag() -> None:
     "stiffness": torch.full((n_envs, 1), ARM_KP[0]),
     "damping": torch.full((n_envs, 1), ARM_KD[0]),
     "force_limit": torch.full((n_envs, 1), ARM_EFFORT_LIMIT[0]),
+    "velocity_limit": torch.full((n_envs, 1), ARM_VELOCITY_LIMIT[0]),
   }
-  for vel_val in (0.0, 2.25, 3.0, -3.0):
+  for vel_val in (0.0, 2.25, -2.25):
     vel = torch.full((n_envs, 1), vel_val)
     tau = DelayedPdActuator.control_law(params, ActuatorCmd(pos_tgt, vel_tgt, eff_tgt, pos, vel))
     torch.testing.assert_close(tau, torch.full((n_envs, 1), ARM_EFFORT_LIMIT[0]))
+  # At +3.0 rad/s, positive accelerating torque is blocked (0.0), while braking (-2.0 target) is allowed.
+  tau_pos_lim = DelayedPdActuator.control_law(
+    params, ActuatorCmd(pos_tgt, vel_tgt, eff_tgt, pos, torch.full((n_envs, 1), 3.0))
+  )
+  torch.testing.assert_close(tau_pos_lim, torch.zeros(n_envs, 1))
+  tau_neg_lim = DelayedPdActuator.control_law(
+    params, ActuatorCmd(torch.full((n_envs, 1), -2.0), vel_tgt, eff_tgt, pos, torch.full((n_envs, 1), -3.0))
+  )
+  torch.testing.assert_close(tau_neg_lim, torch.zeros(n_envs, 1))
+  tau_brake = DelayedPdActuator.control_law(
+    params, ActuatorCmd(torch.full((n_envs, 1), -2.0), vel_tgt, eff_tgt, pos, torch.full((n_envs, 1), 3.0))
+  )
+  torch.testing.assert_close(tau_brake, torch.full((n_envs, 1), -ARM_EFFORT_LIMIT[0]))
 
-  # Check via mjlab Simulation on CPU that delay lag is constant across steps and resamples on reset.
-  from mjlab.sim import Simulation, SimulationCfg
-  sim = Simulation(num_envs=16, cfg=SimulationCfg(), model=model, device="cpu")
+  # Check via mjlab Simulation on CPU:
+  # 1) No actuator is fused into FusedActuatorGroup (each arm joint + leg group stays independent).
+  # 2) All 6 arm joints sample independent per-env, per-joint lags (not collapsed to a scalar),
+  #    remain strictly constant across physics steps, and only reset rows resample on partial reset.
+  from mjlab.sim import MujocoCfg, Simulation, SimulationCfg
+
+  sim = Simulation(
+    num_envs=16,
+    cfg=SimulationCfg(mujoco=MujocoCfg(timestep=0.005)),
+    model=model,
+    device="cpu",
+  )
   entity.initialize(model, sim.model, sim.data, "cpu")
-  entity.reset()
-  arm_buf = entity.actuators[2]._delay_buffer
-  assert arm_buf is not None
-  lags_ep1 = arm_buf.current_lags.clone()
-  assert bool((lags_ep1 >= 3).all() and (lags_ep1 <= 9).all())
+  assert len(entity._fused_actuator_group._groups) == 0
+  assert len(entity._custom_actuators) == 8
 
-  # Step 20 physics substeps: lags must stay strictly constant within the episode,
-  # and a step target change at step 10 must arrive at joint1 ctrl after exact lag[e] steps.
-  j1_ctrl_id = int(entity.actuators[2].global_ctrl_ids[0])
+  entity.reset()
+  arm_acts = entity.actuators[2:8]
+  arm_lags_ep1 = torch.cat([act.current_lags for act in arm_acts], dim=1).clone()
+  assert arm_lags_ep1.shape == (16, 6)
+  assert bool((arm_lags_ep1 >= 3).all() and (arm_lags_ep1 <= 9).all())
+  assert not bool((arm_lags_ep1 == arm_lags_ep1[:, :1]).all(dim=1).all()), (
+    f"Arm 6-joint lags should be sampled independently, got {arm_lags_ep1}"
+  )
+  assert entity.actuators[0].current_lags.shape == (16, 8)
+  assert entity.actuators[1].current_lags.shape == (16, 4)
+
+  # Step 20 physics substeps (`sim.step()`): lags stay strictly constant within the episode,
+  # and a 0.1 rad step target jump on joint1 at step 10 arrives at joint1 ctrl after exact lag[e] steps.
+  lags_j1_ep1 = arm_lags_ep1[:, 0].clone()
+  j1_ctrl_id = int(arm_acts[0].global_ctrl_ids[0])
+  j1_dof_id = int(arm_acts[0]._target_ids[0])
+  tgt_zero = torch.zeros(16, 18)
+  tgt_step = torch.zeros(16, 18)
+  tgt_step[:, j1_dof_id] = 0.1
   for step in range(20):
-    tgt = torch.zeros(16, 18) if step < 10 else torch.ones(16, 18)
-    entity.set_joint_position_target(tgt)
+    entity.set_joint_position_target(tgt_zero if step < 10 else tgt_step)
     entity.write_data_to_sim()
-    assert torch.equal(arm_buf.current_lags, lags_ep1)
+    current_arm_lags = torch.cat([act.current_lags for act in arm_acts], dim=1)
+    assert torch.equal(current_arm_lags, arm_lags_ep1)
     if step >= 10:
       elapsed_since_jump = step - 10
       arrived = sim.data.ctrl[:, j1_ctrl_id] > 1.0
-      expected_arrived = elapsed_since_jump >= lags_ep1
+      expected_arrived = elapsed_since_jump >= lags_j1_ep1
       assert torch.equal(arrived, expected_arrived), (step, arrived, expected_arrived)
+    sim.step()
+    entity.update(0.005)
 
   # Partial reset on subset [0, 5] resamples them while other envs stay untouched.
   other = [i for i in range(16) if i not in (0, 5)]
-  lags_other_before = arm_buf.current_lags[other].clone()
-  changed = False
-  for _ in range(5):
-    entity.reset(torch.tensor([0, 5]))
-    assert torch.equal(arm_buf.current_lags[other], lags_other_before)
-    if not torch.equal(arm_buf.current_lags[[0, 5]], lags_ep1[[0, 5]]):
-      changed = True
-      break
-  assert changed
+  lags_other_before = arm_lags_ep1[other].clone()
+  entity.reset(torch.tensor([0, 5]))
+  arm_lags_after = torch.cat([act.current_lags for act in arm_acts], dim=1)
+  assert torch.equal(arm_lags_after[other], lags_other_before)
+  assert not torch.equal(arm_lags_after[[0, 5]], arm_lags_ep1[[0, 5]])
+
+
+def test_delayed_pd_partial_reset_preserves_unreset_delay_queue_and_velocity_limit() -> None:
+  from mjlab.sim import MujocoCfg, Simulation, SimulationCfg
+
+  # Regression 1: Fixed lag=3 across partial reset (including ManagerBasedRlEnv reset write_data_to_sim):
+  # resetting env 0 between steps must NOT advance env 1's delay queue by 1 extra step.
+  cfg_lag3 = get_go2_piper_robot_cfg(leg_delay=(0, 0), arm_delay=(3, 3))
+  entity = Entity(cfg_lag3)
+  model = entity.spec.compile()
+  sim = Simulation(
+    num_envs=2,
+    cfg=SimulationCfg(mujoco=MujocoCfg(timestep=0.005)),
+    model=model,
+    device="cpu",
+  )
+  entity.initialize(model, sim.model, sim.data, "cpu")
+  sim.reset()
+  entity.reset()
+  entity.write_data_to_sim()
+  sim.forward()
+
+  j1_act = entity.actuators[2]
+  j1_ctrl_id = int(j1_act.global_ctrl_ids[0])
+  j1_dof_id = int(j1_act._target_ids[0])
+  assert torch.equal(j1_act.current_lags, torch.full((2, 1), 3, dtype=torch.long))
+
+  tgt = torch.zeros(2, 18)
+  tgt[:, j1_dof_id] = 2.0
+
+  env1_torques: list[float] = []
+  for step in range(5):
+    entity.set_joint_position_target(tgt)
+    entity.write_data_to_sim()
+    env1_torques.append(float(sim.data.ctrl[1, j1_ctrl_id]))
+    sim.step()
+    entity.update(0.005)
+    # Trigger a partial reset + post-reset write_data_to_sim() + sim.forward() on env 0 after step 1
+    # (matching ManagerBasedRlEnv.step auto-reset at manager_based_rl_env.py:472).
+    if step == 1:
+      p_ids = torch.tensor([0], dtype=torch.long)
+      sim.reset(p_ids)
+      entity.reset(p_ids)
+      entity.write_data_to_sim()
+      sim.forward()
+
+  assert abs(env1_torques[0]) < 0.05
+  assert abs(env1_torques[1]) < 0.05
+  assert abs(env1_torques[2]) < 0.05
+  assert env1_torques[3] == pytest.approx(ARM_EFFORT_LIMIT[0], abs=1e-4)
+  assert env1_torques[4] == pytest.approx(ARM_EFFORT_LIMIT[0], abs=1e-4)
+
+  # Regression 2: Real ManagerBasedRlEnv partial _reset_idx + write_data_to_sim() preserves env 1 lag queue.
+  env_cfg = go2_piper_wbc_env_cfg(stage=1, micro_rough=False, play=False)
+  env_cfg.scene.num_envs = 2
+  env_cfg.decimation = 1
+  env_cfg.events.pop("arm_pd_gains", None)
+  env_cfg.events.pop("leg_pd_gains", None)
+  env = ManagerBasedRlEnv(env_cfg, device="cpu")
+  try:
+    env.reset(seed=7)
+    robot = env.scene["robot"]
+    env_j1_act = robot.actuators[2]
+    env_j1_act.set_lags(3)
+    env_j1_ctrl = int(env_j1_act.global_ctrl_ids[0])
+    env_j1_dof = int(env_j1_act._target_ids[0])
+    step_tgt = robot.data.joint_pos.clone()
+    step_tgt[:, env_j1_dof] += 2.0
+    # Run step 0 & step 1 with explicit step target, reset env 0 after step 1 via _reset_idx + write_data_to_sim.
+    seq_env1: list[float] = []
+    tau_zero_ref: list[float] = []
+    for k in range(5):
+      q1 = float(robot.data.joint_pos[1, env_j1_dof])
+      qd1 = float(robot.data.joint_vel[1, env_j1_dof])
+      tau_zero_ref.append(float(max(-ARM_EFFORT_LIMIT[0], min(ARM_EFFORT_LIMIT[0], -ARM_KP[0] * q1 - ARM_KD[0] * qd1))))
+      robot.set_joint_position_target(step_tgt)
+      env.scene.write_data_to_sim()
+      seq_env1.append(float(env.sim.data.ctrl[1, env_j1_ctrl]))
+      env.sim.step()
+      env.scene.update(dt=env.physics_dt)
+      if k == 1:
+        p_ids = torch.tensor([0], dtype=torch.long)
+        env._reset_idx(p_ids)
+        env.scene.write_data_to_sim()
+        env.sim.forward()
+    assert seq_env1[0] == pytest.approx(tau_zero_ref[0], abs=1e-4)
+    assert seq_env1[1] == pytest.approx(tau_zero_ref[1], abs=1e-4)
+    assert seq_env1[2] == pytest.approx(tau_zero_ref[2], abs=1e-4)
+    assert seq_env1[3] == pytest.approx(ARM_EFFORT_LIMIT[0], abs=1e-4)
+  finally:
+    env.close()
+
+  # Regression 3: Velocity-limit enforcement (3.0 rad/s & -3.0 rad/s must not accelerate to ~3.3478 rad/s)
+  # while keeping full 11.8125 Nm constant effort at 2.25 rad/s.
+  cfg_vel = get_go2_piper_robot_cfg(leg_delay=(0, 0), arm_delay=(0, 0))
+  v_entity = Entity(cfg_vel)
+  v_model = v_entity.spec.compile()
+  v_sim = Simulation(
+    num_envs=3,
+    cfg=SimulationCfg(mujoco=MujocoCfg(timestep=0.005)),
+    model=v_model,
+    device="cpu",
+  )
+  v_entity.initialize(v_model, v_sim.model, v_sim.data, "cpu")
+  v_sim.reset()
+  v_entity.reset()
+  j1_ctrl = int(v_entity.actuators[2].global_ctrl_ids[0])
+  j1_dof = int(v_entity.actuators[2]._target_ids[0])
+
+  qpos_init = v_entity.data.default_joint_pos.clone()
+  qvel_init = torch.zeros(3, 18)
+  qvel_init[0, j1_dof] = 3.0
+  qvel_init[1, j1_dof] = -3.0
+  qvel_init[2, j1_dof] = 2.25
+  v_entity.write_joint_state_to_sim(qpos_init, qvel_init)
+  v_sim.forward()
+
+  vel_tgt = torch.zeros(3, 18)
+  vel_tgt[0, j1_dof] = 2.0
+  vel_tgt[1, j1_dof] = -2.0
+  vel_tgt[2, j1_dof] = 2.0
+  v_entity.set_joint_position_target(vel_tgt)
+  v_entity.write_data_to_sim()
+
+  assert float(v_sim.data.ctrl[0, j1_ctrl]) == pytest.approx(0.0, abs=1e-6)
+  assert float(v_sim.data.ctrl[1, j1_ctrl]) == pytest.approx(0.0, abs=1e-6)
+  assert float(v_sim.data.ctrl[2, j1_ctrl]) == pytest.approx(ARM_EFFORT_LIMIT[0], abs=1e-5)
+
+  max_pos_vel = -float("inf")
+  min_neg_vel = float("inf")
+  for _ in range(20):
+    v_entity.set_joint_position_target(vel_tgt)
+    v_entity.write_data_to_sim()
+    v_sim.step()
+    v_entity.update(0.005)
+    jv = v_entity.data.joint_vel[:, j1_dof]
+    max_pos_vel = max(max_pos_vel, float(jv[0]))
+    min_neg_vel = min(min_neg_vel, float(jv[1]))
+  assert max_pos_vel <= 3.0 + 1e-4, f"Positive velocity overshot limit: {max_pos_vel}"
+  assert min_neg_vel >= -3.0 - 1e-4, f"Negative velocity overshot limit: {min_neg_vel}"
 
 
 # ---------------------------------------------------------------------------

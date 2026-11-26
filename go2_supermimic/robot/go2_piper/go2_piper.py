@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
 
 import mujoco
+import numpy as np
 import torch
 
-from mjlab.actuator import IdealPdActuator, IdealPdActuatorCfg
+from mjlab.actuator import ActuatorCmd, IdealPdActuator, IdealPdActuatorCfg
+from mjlab.actuator.actuator import TransmissionType
+from mjlab.actuator.pd_actuator import pd_torque
 from mjlab.entity import Entity, EntityArticulationInfoCfg, EntityCfg
 from mjlab.utils.spec_config import CollisionCfg
 
@@ -72,46 +76,244 @@ def get_spec() -> mujoco.MjSpec:
 
 
 class DelayedPdActuator(IdealPdActuator["DelayedPdActuatorCfg"]):
-  """Ideal PD actuator with constant effort clamp and per-episode sampled delay lag.
+  """Ideal PD actuator with constant effort, velocity_limit_sim clamp, and per-joint episode delay.
 
-  Inherits ``IdealPdActuator.compute`` unchanged so ``FusedActuatorGroup`` still
-  fuses actuators sharing delay config, while sampling a per-env delay lag in
-  ``[delay_min_lag, delay_max_lag]`` on ``reset()`` and holding it constant for
-  the entire episode (``delay_hold_prob = 1.0`` disables per-step resampling).
+  Overrides ``compute()`` deliberately so ``mjlab.actuator.FusedActuatorGroup``
+  keeps each actuator un-fused:
+  1. Preserves independent per-joint, per-env episode delay lags (not collapsed
+     into a fused group scalar lag).
+  2. Advances the per-env delay ring buffer strictly once per real ``sim.step()``
+     (gated on ``sim.data.time`` advancement since the last write), so
+     post-reset ``write_data_to_sim()`` calls in ``ManagerBasedRlEnv`` never
+     double-advance untouched environments on partial resets.
+  3. Enforces a ``velocity_limit_sim``-equivalent unilateral velocity constraint
+     with full constant ``effort_limit`` torque inside ``|qd| < velocity_limit``
+     (zero DC back-EMF ramp).
   """
 
-  def _sample_and_set_lags(self, env_ids: torch.Tensor | slice | None = None) -> None:
-    if self._delay_buffer is None:
-      return
-    buf = self._delay_buffer
-    if env_ids is None:
-      count = buf.batch_size
-      target_ids: torch.Tensor | slice = slice(None)
-    elif isinstance(env_ids, slice):
-      indices = range(*env_ids.indices(buf.batch_size))
-      count = len(indices)
-      target_ids = env_ids
-    else:
-      count = int(env_ids.numel()) if isinstance(env_ids, torch.Tensor) else len(env_ids)
-      target_ids = env_ids
-    if count == 0:
-      return
-    lags = torch.randint(
+  def __init__(
+    self,
+    cfg: DelayedPdActuatorCfg,
+    entity: Entity,
+    target_ids: list[int],
+    target_names: list[str],
+  ) -> None:
+    super().__init__(cfg, entity, target_ids, target_names)
+    self.velocity_limit: torch.Tensor | None = None
+    self.velocity_step_gain: torch.Tensor | None = None
+    self._lags: torch.Tensor | None = None
+    self._history_len: int = 0
+    self._cmd_history: torch.Tensor | None = None
+    self._write_idx: torch.Tensor | None = None
+    self._has_pending: torch.Tensor | None = None
+    self._last_cmd: torch.Tensor | None = None
+    self._last_sim_time: torch.Tensor | None = None
+    self._env_arange: torch.Tensor | None = None
+    self._jnt_arange: torch.Tensor | None = None
+
+  def _init_delay_buffer(self, num_envs: int, device: str) -> None:
+    """Disable base shared DelayBuffer; delay is managed per-(env, joint) below."""
+    del num_envs, device
+    self._delay_buffer = None
+
+  @property
+  def current_lags(self) -> torch.Tensor | None:
+    """Per-env, per-joint episode delay lags in physics steps. Shape (num_envs, num_joints)."""
+    return self._lags
+
+  @staticmethod
+  def control_law(params: dict[str, torch.Tensor], cmd: ActuatorCmd) -> torch.Tensor:
+    torque = pd_torque(params["stiffness"], params["damping"], cmd)
+    force_limit = params["force_limit"]
+    torque = torch.clamp(torque, -force_limit, force_limit)
+    vel_limit = params.get("velocity_limit")
+    if vel_limit is not None:
+      vel_step_gain = params.get("velocity_step_gain")
+      if vel_step_gain is not None:
+        max_eff = torch.clamp(
+          vel_step_gain * (vel_limit - cmd.vel),
+          min=-force_limit,
+          max=force_limit,
+        )
+        min_eff = torch.clamp(
+          vel_step_gain * (-vel_limit - cmd.vel),
+          min=-force_limit,
+          max=force_limit,
+        )
+        torque = torch.clamp(torque, min=min_eff, max=max_eff)
+      else:
+        torque = torch.where(
+          (cmd.vel >= vel_limit) & (torque > 0.0),
+          torch.zeros_like(torque),
+          torque,
+        )
+        torque = torch.where(
+          (cmd.vel <= -vel_limit) & (torque < 0.0),
+          torch.zeros_like(torque),
+          torque,
+        )
+    return torque
+
+  def compute(self, cmd: ActuatorCmd) -> torch.Tensor:
+    assert self.stiffness is not None
+    assert self.damping is not None
+    assert self.force_limit is not None
+    params: dict[str, torch.Tensor] = {
+      "stiffness": self.stiffness,
+      "damping": self.damping,
+      "force_limit": self.force_limit,
+    }
+    if self.velocity_limit is not None:
+      params["velocity_limit"] = self.velocity_limit
+    if self.velocity_step_gain is not None:
+      params["velocity_step_gain"] = self.velocity_step_gain
+    return DelayedPdActuator.control_law(params, cmd)
+
+  def _sample_lags(self, count: int) -> torch.Tensor:
+    assert self._lags is not None
+    num_joints = len(self._target_names)
+    if not self.has_delay:
+      return torch.zeros((count, num_joints), dtype=torch.long, device=self._lags.device)
+    return torch.randint(
       self.cfg.delay_min_lag,
       self.cfg.delay_max_lag + 1,
-      (count,),
+      (count, num_joints),
       dtype=torch.long,
-      device=buf.device,
+      device=self._lags.device,
     )
-    buf.set_lags(lags, target_ids)
+
+  def set_lags(
+    self,
+    lags: torch.Tensor | int,
+    env_ids: torch.Tensor | slice | None = None,
+  ) -> None:
+    """Set delay lag values for specified environments (broadcasting to per-joint shape)."""
+    if self._lags is None:
+      return
+    idx: torch.Tensor | slice = slice(None) if env_ids is None else env_ids
+    lags_t = torch.as_tensor(lags, dtype=torch.long, device=self._lags.device)
+    if lags_t.ndim == 0:
+      lags_t = lags_t.view(1, 1)
+    elif lags_t.ndim == 1:
+      lags_t = lags_t.unsqueeze(-1)
+    self._lags[idx] = lags_t.clamp(self.cfg.delay_min_lag, self.cfg.delay_max_lag)
 
   def initialize(self, mj_model, model, data, device: str) -> None:
     super().initialize(mj_model, model, data, device)
-    self._sample_and_set_lags(None)
+    num_envs = data.nworld
+    num_joints = len(self._target_names)
+
+    # Precompute semi-implicit inertia/dt gain for velocity_limit_sim enforcement.
+    if (
+      self.cfg.velocity_limit is not None
+      and self.cfg.transmission_type == TransmissionType.JOINT
+    ):
+      self.velocity_limit = torch.full(
+        (num_envs, num_joints), float(self.cfg.velocity_limit), dtype=torch.float, device=device
+      )
+      dt = float(mj_model.opt.timestep)
+      if dt > 0.0:
+        mj_data = mujoco.MjData(mj_model)
+        if mj_model.nkey > 0:
+          mujoco.mj_resetDataKeyframe(mj_model, mj_data, 0)
+        mujoco.mj_forward(mj_model, mj_data)
+        full_mass = np.zeros((mj_model.nv, mj_model.nv), dtype=np.float64)
+        mujoco.mj_fullM(mj_model, mj_data, full_mass)
+        assert self._target_ids is not None
+        v_adrs = self.entity.indexing.joint_v_adr[self._target_ids].detach().cpu().numpy()
+        step_gain_np = np.diag(full_mass)[v_adrs] / dt + mj_model.dof_damping[v_adrs]
+        self.velocity_step_gain = (
+          torch.as_tensor(step_gain_np, dtype=torch.float, device=device)
+          .unsqueeze(0)
+          .expand(num_envs, num_joints)
+          .clone()
+        )
+      else:
+        self.velocity_step_gain = None
+    else:
+      self.velocity_limit = None
+      self.velocity_step_gain = None
+
+    self._lags = torch.zeros((num_envs, num_joints), dtype=torch.long, device=device)
+    if self.has_delay:
+      self._history_len = int(self.cfg.delay_max_lag)
+      self._cmd_history = torch.zeros(
+        (num_envs, self._history_len, num_joints, 3), dtype=torch.float, device=device
+      )
+      self._write_idx = torch.zeros(num_envs, dtype=torch.long, device=device)
+      self._has_pending = torch.zeros(num_envs, dtype=torch.bool, device=device)
+      self._last_cmd = torch.zeros((num_envs, num_joints, 3), dtype=torch.float, device=device)
+      self._last_sim_time = torch.full(
+        (num_envs,), float("nan"), dtype=data.time.dtype, device=device
+      )
+      self._env_arange = torch.arange(num_envs, dtype=torch.long, device=device).unsqueeze(-1)
+      self._jnt_arange = torch.arange(num_joints, dtype=torch.long, device=device).unsqueeze(0)
+    self._lags.copy_(self._sample_lags(num_envs))
+
+  def apply_delay(self, cmd: ActuatorCmd) -> ActuatorCmd:
+    if not self.has_delay:
+      return cmd
+    assert self._lags is not None
+    assert self._cmd_history is not None
+    assert self._write_idx is not None
+    assert self._has_pending is not None
+    assert self._last_cmd is not None
+    assert self._last_sim_time is not None
+    assert self._env_arange is not None
+    assert self._jnt_arange is not None
+
+    stacked = torch.stack((cmd.position_target, cmd.velocity_target, cmd.effort_target), dim=-1)
+    sim_time = self.entity.data.data.time
+    stepped = self._has_pending & (sim_time > self._last_sim_time)
+
+    env_flat = self._env_arange.squeeze(-1)
+    old_slot = self._cmd_history[env_flat, self._write_idx]
+    self._cmd_history[env_flat, self._write_idx] = torch.where(
+      stepped[:, None, None], self._last_cmd, old_slot
+    )
+    self._write_idx = (self._write_idx + stepped.to(torch.long)).remainder(self._history_len)
+
+    self._last_cmd.copy_(stacked)
+    self._last_sim_time.copy_(sim_time)
+    self._has_pending.fill_(True)
+
+    read_slots = (self._write_idx.unsqueeze(-1) - self._lags).remainder(self._history_len)
+    delayed_hist = self._cmd_history[self._env_arange, read_slots, self._jnt_arange]
+    delayed = torch.where((self._lags == 0).unsqueeze(-1), stacked, delayed_hist)
+    return dataclasses.replace(
+      cmd,
+      position_target=delayed[..., 0],
+      velocity_target=delayed[..., 1],
+      effort_target=delayed[..., 2],
+    )
 
   def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
-    super().reset(env_ids)
-    self._sample_and_set_lags(env_ids)
+    if self._lags is None:
+      return
+    batch_size = self._lags.shape[0]
+    if env_ids is None:
+      idx: torch.Tensor | slice = slice(None)
+      count = batch_size
+    elif isinstance(env_ids, slice):
+      count = len(range(*env_ids.indices(batch_size)))
+      idx = env_ids
+    else:
+      count = int(env_ids.numel()) if isinstance(env_ids, torch.Tensor) else len(env_ids)
+      idx = env_ids
+    if count == 0:
+      return
+    self._lags[idx] = self._sample_lags(count)
+    if self.has_delay:
+      assert self._cmd_history is not None
+      assert self._write_idx is not None
+      assert self._has_pending is not None
+      assert self._last_cmd is not None
+      assert self._last_sim_time is not None
+      self._cmd_history[idx] = 0.0
+      self._write_idx[idx] = 0
+      self._has_pending[idx] = False
+      self._last_cmd[idx] = 0.0
+      self._last_sim_time[idx] = float("nan")
 
 
 @dataclass(kw_only=True)
