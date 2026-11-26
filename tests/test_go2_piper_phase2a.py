@@ -342,8 +342,8 @@ def test_delayed_pd_actuator_constant_effort_and_episode_constant_lag() -> None:
   model = entity.spec.compile()
   model.opt.timestep = 0.005
 
-  # Check actuator control_law delivers full constant effort_limit at 0 and 2.25 rad/s,
-  # while blocking accelerating torque at +/-velocity_limit (3.0 rad/s).
+  # Check actuator control_law and compute() strictly deliver full constant effort_limit
+  # across 0.0, 2.25, and 2.99 rad/s (Isaac Lab #460 DelayedPDActuator formula, zero velocity derating).
   arm_act = entity.actuators[2]
   assert isinstance(arm_act, DelayedPdActuator)
   n_envs = 8
@@ -355,30 +355,18 @@ def test_delayed_pd_actuator_constant_effort_and_episode_constant_lag() -> None:
     "stiffness": torch.full((n_envs, 1), ARM_KP[0]),
     "damping": torch.full((n_envs, 1), ARM_KD[0]),
     "force_limit": torch.full((n_envs, 1), ARM_EFFORT_LIMIT[0]),
-    "velocity_limit": torch.full((n_envs, 1), ARM_VELOCITY_LIMIT[0]),
   }
-  for vel_val in (0.0, 2.25, -2.25):
+  for vel_val in (0.0, 2.25, 2.99, -2.25, -2.99):
     vel = torch.full((n_envs, 1), vel_val)
     tau = DelayedPdActuator.control_law(params, ActuatorCmd(pos_tgt, vel_tgt, eff_tgt, pos, vel))
     torch.testing.assert_close(tau, torch.full((n_envs, 1), ARM_EFFORT_LIMIT[0]))
-  # At +3.0 rad/s, positive accelerating torque is blocked (0.0), while braking (-2.0 target) is allowed.
-  tau_pos_lim = DelayedPdActuator.control_law(
-    params, ActuatorCmd(pos_tgt, vel_tgt, eff_tgt, pos, torch.full((n_envs, 1), 3.0))
-  )
-  torch.testing.assert_close(tau_pos_lim, torch.zeros(n_envs, 1))
-  tau_neg_lim = DelayedPdActuator.control_law(
-    params, ActuatorCmd(torch.full((n_envs, 1), -2.0), vel_tgt, eff_tgt, pos, torch.full((n_envs, 1), -3.0))
-  )
-  torch.testing.assert_close(tau_neg_lim, torch.zeros(n_envs, 1))
-  tau_brake = DelayedPdActuator.control_law(
-    params, ActuatorCmd(torch.full((n_envs, 1), -2.0), vel_tgt, eff_tgt, pos, torch.full((n_envs, 1), 3.0))
-  )
-  torch.testing.assert_close(tau_brake, torch.full((n_envs, 1), -ARM_EFFORT_LIMIT[0]))
 
   # Check via mjlab Simulation on CPU:
   # 1) No actuator is fused into FusedActuatorGroup (each arm joint + leg group stays independent).
-  # 2) All 6 arm joints sample independent per-env, per-joint lags (not collapsed to a scalar),
-  #    remain strictly constant across physics steps, and only reset rows resample on partial reset.
+  # 2) All 6 arm joints sample independent per-env lags (not collapsed to a scalar), while each leg
+  #    group (leg_hip_thigh, leg_calf) uses one per-env lag shared across its joints (b2cce16 parity),
+  #    remaining strictly constant within the episode and resampling only reset rows on partial reset.
+  # 3) arm_act.compute() at qd=2.99 and qd=2.25 rad/s still outputs full constant 11.8125 Nm.
   from mjlab.sim import MujocoCfg, Simulation, SimulationCfg
 
   sim = Simulation(
@@ -391,16 +379,30 @@ def test_delayed_pd_actuator_constant_effort_and_episode_constant_lag() -> None:
   assert len(entity._fused_actuator_group._groups) == 0
   assert len(entity._custom_actuators) == 8
 
+  for vel_val in (2.25, 2.99):
+    tau_j1 = arm_act.compute(
+      ActuatorCmd(
+        position_target=torch.full((16, 1), 2.0),
+        velocity_target=torch.zeros(16, 1),
+        effort_target=torch.zeros(16, 1),
+        pos=torch.zeros(16, 1),
+        vel=torch.full((16, 1), vel_val),
+      )
+    )
+    torch.testing.assert_close(tau_j1, torch.full((16, 1), ARM_EFFORT_LIMIT[0]))
+
   entity.reset()
   arm_acts = entity.actuators[2:8]
-  arm_lags_ep1 = torch.cat([act.current_lags for act in arm_acts], dim=1).clone()
+  arm_lags_ep1 = torch.stack([act.current_lags for act in arm_acts], dim=1).clone()
   assert arm_lags_ep1.shape == (16, 6)
   assert bool((arm_lags_ep1 >= 3).all() and (arm_lags_ep1 <= 9).all())
   assert not bool((arm_lags_ep1 == arm_lags_ep1[:, :1]).all(dim=1).all()), (
     f"Arm 6-joint lags should be sampled independently, got {arm_lags_ep1}"
   )
-  assert entity.actuators[0].current_lags.shape == (16, 8)
-  assert entity.actuators[1].current_lags.shape == (16, 4)
+  assert entity.actuators[0].current_lags.shape == (16,)
+  assert entity.actuators[1].current_lags.shape == (16,)
+  assert bool((entity.actuators[0].current_lags >= 1).all() and (entity.actuators[0].current_lags <= 4).all())
+  assert bool((entity.actuators[1].current_lags >= 1).all() and (entity.actuators[1].current_lags <= 4).all())
 
   # Step 20 physics substeps (`sim.step()`): lags stay strictly constant within the episode,
   # and a 0.1 rad step target jump on joint1 at step 10 arrives at joint1 ctrl after exact lag[e] steps.
@@ -413,7 +415,7 @@ def test_delayed_pd_actuator_constant_effort_and_episode_constant_lag() -> None:
   for step in range(20):
     entity.set_joint_position_target(tgt_zero if step < 10 else tgt_step)
     entity.write_data_to_sim()
-    current_arm_lags = torch.cat([act.current_lags for act in arm_acts], dim=1)
+    current_arm_lags = torch.stack([act.current_lags for act in arm_acts], dim=1)
     assert torch.equal(current_arm_lags, arm_lags_ep1)
     if step >= 10:
       elapsed_since_jump = step - 10
@@ -427,7 +429,7 @@ def test_delayed_pd_actuator_constant_effort_and_episode_constant_lag() -> None:
   other = [i for i in range(16) if i not in (0, 5)]
   lags_other_before = arm_lags_ep1[other].clone()
   entity.reset(torch.tensor([0, 5]))
-  arm_lags_after = torch.cat([act.current_lags for act in arm_acts], dim=1)
+  arm_lags_after = torch.stack([act.current_lags for act in arm_acts], dim=1)
   assert torch.equal(arm_lags_after[other], lags_other_before)
   assert not torch.equal(arm_lags_after[[0, 5]], arm_lags_ep1[[0, 5]])
 
@@ -455,7 +457,7 @@ def test_delayed_pd_partial_reset_preserves_unreset_delay_queue_and_velocity_lim
   j1_act = entity.actuators[2]
   j1_ctrl_id = int(j1_act.global_ctrl_ids[0])
   j1_dof_id = int(j1_act._target_ids[0])
-  assert torch.equal(j1_act.current_lags, torch.full((2, 1), 3, dtype=torch.long))
+  assert torch.equal(j1_act.current_lags, torch.full((2,), 3, dtype=torch.long))
 
   tgt = torch.zeros(2, 18)
   tgt[:, j1_dof_id] = 2.0
@@ -522,13 +524,17 @@ def test_delayed_pd_partial_reset_preserves_unreset_delay_queue_and_velocity_lim
   finally:
     env.close()
 
-  # Regression 3: Velocity-limit enforcement (3.0 rad/s & -3.0 rad/s must not accelerate to ~3.3478 rad/s)
-  # while keeping full 11.8125 Nm constant effort at 2.25 rad/s.
+  # Regression 3: Decoupled actuator torque vs sim-level velocity_limit_sim enforcement.
+  # - At qd=2.99 and 2.25 rad/s, actuator outputs FULL constant 11.8125 Nm (no derating).
+  # - Across multi-pose arm states including Codex gravity-coupled case
+  #   q_arm=[-0.09737, 0.11746, 0.17631, -0.14673, 0.17384, 0.03743] with joint2 qd=3.0 & tau=0,
+  #   all 18 joints strictly satisfy |qd| <= velocity_limit + 1e-6 after every physics substep.
   cfg_vel = get_go2_piper_robot_cfg(leg_delay=(0, 0), arm_delay=(0, 0))
   v_entity = Entity(cfg_vel)
   v_model = v_entity.spec.compile()
+  n_vel_envs = 8
   v_sim = Simulation(
-    num_envs=3,
+    num_envs=n_vel_envs,
     cfg=SimulationCfg(mujoco=MujocoCfg(timestep=0.005)),
     model=v_model,
     device="cpu",
@@ -540,36 +546,51 @@ def test_delayed_pd_partial_reset_preserves_unreset_delay_queue_and_velocity_lim
   j1_dof = int(v_entity.actuators[2]._target_ids[0])
 
   qpos_init = v_entity.data.default_joint_pos.clone()
-  qvel_init = torch.zeros(3, 18)
+  qvel_init = torch.zeros(n_vel_envs, 18)
+  # Env 0..3: extreme +3.0, -3.0, +2.25, +2.99 rad/s on joint1
   qvel_init[0, j1_dof] = 3.0
   qvel_init[1, j1_dof] = -3.0
   qvel_init[2, j1_dof] = 2.25
+  qvel_init[3, j1_dof] = 2.99
+  # Env 4: Codex exact gravity-coupled random arm pose with joint2 vel=3.0 rad/s and tau=0
+  codex_q_arm = torch.tensor([-0.09737, 0.11746, 0.17631, -0.14673, 0.17384, 0.03743])
+  qpos_init[4, 12:18] = codex_q_arm
+  qvel_init[4, 13] = 3.0  # joint2
+  # Env 5..7: random arm poses with large initial velocities across multiple joints
+  torch.manual_seed(99)
+  qpos_init[5:8, 12:18] = torch.empty(3, 6).uniform_(-0.5, 0.5).clamp(
+    v_entity.data.joint_pos_limits[5:8, 12:18, 0] + 0.05,
+    v_entity.data.joint_pos_limits[5:8, 12:18, 1] - 0.05,
+  )
+  qvel_init[5:8, 12:18] = torch.empty(3, 6).uniform_(-3.0, 3.0)
   v_entity.write_joint_state_to_sim(qpos_init, qvel_init)
   v_sim.forward()
 
-  vel_tgt = torch.zeros(3, 18)
+  vel_tgt = torch.zeros(n_vel_envs, 18)
   vel_tgt[0, j1_dof] = 2.0
   vel_tgt[1, j1_dof] = -2.0
   vel_tgt[2, j1_dof] = 2.0
+  vel_tgt[3, j1_dof] = 2.0
+  # Env 4 keeps tau=0 (zero gains temporarily on env 4 to test pure zero-torque gravity coupling)
+  for a in v_entity.actuators:
+    a.set_gains(torch.tensor([4]), kp=torch.zeros(1, len(a.target_ids)), kd=torch.zeros(1, len(a.target_ids)))
+  vel_tgt[5:8, 12:18] = torch.tensor([[2.0, 2.0, -2.0, 2.0, -2.0, 2.0]] * 3)
   v_entity.set_joint_position_target(vel_tgt)
   v_entity.write_data_to_sim()
 
-  assert float(v_sim.data.ctrl[0, j1_ctrl]) == pytest.approx(0.0, abs=1e-6)
-  assert float(v_sim.data.ctrl[1, j1_ctrl]) == pytest.approx(0.0, abs=1e-6)
   assert float(v_sim.data.ctrl[2, j1_ctrl]) == pytest.approx(ARM_EFFORT_LIMIT[0], abs=1e-5)
+  assert float(v_sim.data.ctrl[3, j1_ctrl]) == pytest.approx(ARM_EFFORT_LIMIT[0], abs=1e-5)
+  assert float(v_sim.data.ctrl[4, j1_ctrl]) == pytest.approx(0.0, abs=1e-6)
 
-  max_pos_vel = -float("inf")
-  min_neg_vel = float("inf")
+  vel_limits = torch.tensor(LEG_VELOCITY_LIMIT + ARM_VELOCITY_LIMIT)
   for _ in range(20):
     v_entity.set_joint_position_target(vel_tgt)
     v_entity.write_data_to_sim()
     v_sim.step()
     v_entity.update(0.005)
-    jv = v_entity.data.joint_vel[:, j1_dof]
-    max_pos_vel = max(max_pos_vel, float(jv[0]))
-    min_neg_vel = min(min_neg_vel, float(jv[1]))
-  assert max_pos_vel <= 3.0 + 1e-4, f"Positive velocity overshot limit: {max_pos_vel}"
-  assert min_neg_vel >= -3.0 - 1e-4, f"Negative velocity overshot limit: {min_neg_vel}"
+    assert bool((v_entity.data.joint_vel.abs() <= vel_limits[None, :] + 1e-6).all()), (
+      f"Exceeded velocity limit: max_excess={(v_entity.data.joint_vel.abs() - vel_limits[None, :]).max().item()}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -890,7 +911,8 @@ def test_go2_piper_wbc_gpu_50_step_rollout_and_3frame_obs_contract(stage: int) -
       torch.testing.assert_close(slices3[name][:, 1, :], frame_hist[-2][name], atol=1e-4, rtol=1e-4)
       torch.testing.assert_close(slices3[name][:, 2, :], frame_hist[-1][name], atol=1e-4, rtol=1e-4)
 
-    # Full 50-step rollout with random actions & continuous arm slew check.
+    # Full 50-step rollout with random actions, continuous arm slew check, and GPU velocity_limit_sim check.
+    vel_limits_cuda = torch.tensor(LEG_VELOCITY_LIMIT + ARM_VELOCITY_LIMIT, device="cuda:0")
     prev_q_ref_arm = action_term.q_ref_arm.clone()
     for step_idx in range(50):
       actions = (torch.rand(16, 18, device="cuda:0") * 2.0 - 1.0) * 4.0
@@ -898,6 +920,7 @@ def test_go2_piper_wbc_gpu_50_step_rollout_and_3frame_obs_contract(stage: int) -
       actor_obs = obs["actor"]
       assert actor_obs.shape == (16, 210)
       assert bool(torch.isfinite(actor_obs).all())
+      assert bool((robot.data.joint_vel.abs() <= vel_limits_cuda + 1e-5).all())
       if step_idx >= 1:
         continuous = env.episode_length_buf >= 2
         if bool(continuous.any()):

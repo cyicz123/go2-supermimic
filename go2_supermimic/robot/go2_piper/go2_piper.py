@@ -7,12 +7,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import mujoco
-import numpy as np
 import torch
 
 from mjlab.actuator import ActuatorCmd, IdealPdActuator, IdealPdActuatorCfg
 from mjlab.actuator.actuator import TransmissionType
-from mjlab.actuator.pd_actuator import pd_torque
 from mjlab.entity import Entity, EntityArticulationInfoCfg, EntityCfg
 from mjlab.utils.spec_config import CollisionCfg
 
@@ -76,19 +74,21 @@ def get_spec() -> mujoco.MjSpec:
 
 
 class DelayedPdActuator(IdealPdActuator["DelayedPdActuatorCfg"]):
-  """Ideal PD actuator with constant effort, velocity_limit_sim clamp, and per-joint episode delay.
+  """Isaac Lab #460 DelayedPDActuator parity: pure constant-effort PD + sim-level velocity clamp.
 
   Overrides ``compute()`` deliberately so ``mjlab.actuator.FusedActuatorGroup``
-  keeps each actuator un-fused:
-  1. Preserves independent per-joint, per-env episode delay lags (not collapsed
-     into a fused group scalar lag).
+  keeps each actuator group un-fused:
+  1. Matches Isaac Lab ``DelayedPDActuator`` group-level ``DelayBuffer(per_env=True)``:
+     each actuator group samples one scalar episode lag per env (``leg_hip_thigh``
+     8 joints share a lag, ``leg_calf`` 4 joints share a lag, and ``joint1..joint6``
+     are 6 separate actuators so all 6 arm joints get independent per-env lags).
   2. Advances the per-env delay ring buffer strictly once per real ``sim.step()``
-     (gated on ``sim.data.time`` advancement since the last write), so
-     post-reset ``write_data_to_sim()`` calls in ``ManagerBasedRlEnv`` never
-     double-advance untouched environments on partial resets.
-  3. Enforces a ``velocity_limit_sim``-equivalent unilateral velocity constraint
-     with full constant ``effort_limit`` torque inside ``|qd| < velocity_limit``
-     (zero DC back-EMF ramp).
+     (gated on ``sim.data.time`` advancement), so post-reset ``write_data_to_sim()``
+     calls in ``ManagerBasedRlEnv`` never double-advance un-reset rows on partial resets.
+  3. Decouples torque computation from velocity limits: ``compute()`` applies ONLY
+     pure PD + constant ``effort_limit`` clamp (zero velocity-based torque derating),
+     while ``update()`` enforces ``velocity_limit_sim`` post-substep on ``qvel`` so
+     ``|qd| <= velocity_limit`` even under zero torque with gravity/Coriolis coupling.
   """
 
   def __init__(
@@ -100,7 +100,7 @@ class DelayedPdActuator(IdealPdActuator["DelayedPdActuatorCfg"]):
   ) -> None:
     super().__init__(cfg, entity, target_ids, target_names)
     self.velocity_limit: torch.Tensor | None = None
-    self.velocity_step_gain: torch.Tensor | None = None
+    self._joint_v_adrs: torch.Tensor | None = None
     self._lags: torch.Tensor | None = None
     self._history_len: int = 0
     self._cmd_history: torch.Tensor | None = None
@@ -109,75 +109,41 @@ class DelayedPdActuator(IdealPdActuator["DelayedPdActuatorCfg"]):
     self._last_cmd: torch.Tensor | None = None
     self._last_sim_time: torch.Tensor | None = None
     self._env_arange: torch.Tensor | None = None
-    self._jnt_arange: torch.Tensor | None = None
 
   def _init_delay_buffer(self, num_envs: int, device: str) -> None:
-    """Disable base shared DelayBuffer; delay is managed per-(env, joint) below."""
+    """Disable base shared DelayBuffer; delay is managed per actuator group below."""
     del num_envs, device
     self._delay_buffer = None
 
   @property
   def current_lags(self) -> torch.Tensor | None:
-    """Per-env, per-joint episode delay lags in physics steps. Shape (num_envs, num_joints)."""
+    """Per-env episode delay lags in physics steps for this actuator group. Shape (num_envs,)."""
     return self._lags
 
   @staticmethod
   def control_law(params: dict[str, torch.Tensor], cmd: ActuatorCmd) -> torch.Tensor:
-    torque = pd_torque(params["stiffness"], params["damping"], cmd)
-    force_limit = params["force_limit"]
-    torque = torch.clamp(torque, -force_limit, force_limit)
-    vel_limit = params.get("velocity_limit")
-    if vel_limit is not None:
-      vel_step_gain = params.get("velocity_step_gain")
-      if vel_step_gain is not None:
-        max_eff = torch.clamp(
-          vel_step_gain * (vel_limit - cmd.vel),
-          min=-force_limit,
-          max=force_limit,
-        )
-        min_eff = torch.clamp(
-          vel_step_gain * (-vel_limit - cmd.vel),
-          min=-force_limit,
-          max=force_limit,
-        )
-        torque = torch.clamp(torque, min=min_eff, max=max_eff)
-      else:
-        torque = torch.where(
-          (cmd.vel >= vel_limit) & (torque > 0.0),
-          torch.zeros_like(torque),
-          torque,
-        )
-        torque = torch.where(
-          (cmd.vel <= -vel_limit) & (torque < 0.0),
-          torch.zeros_like(torque),
-          torque,
-        )
-    return torque
+    """Pure PD control law with constant ``effort_limit`` clamp (no velocity derating)."""
+    return IdealPdActuator.control_law(params, cmd)
 
   def compute(self, cmd: ActuatorCmd) -> torch.Tensor:
     assert self.stiffness is not None
     assert self.damping is not None
     assert self.force_limit is not None
-    params: dict[str, torch.Tensor] = {
+    params = {
       "stiffness": self.stiffness,
       "damping": self.damping,
       "force_limit": self.force_limit,
     }
-    if self.velocity_limit is not None:
-      params["velocity_limit"] = self.velocity_limit
-    if self.velocity_step_gain is not None:
-      params["velocity_step_gain"] = self.velocity_step_gain
     return DelayedPdActuator.control_law(params, cmd)
 
   def _sample_lags(self, count: int) -> torch.Tensor:
     assert self._lags is not None
-    num_joints = len(self._target_names)
     if not self.has_delay:
-      return torch.zeros((count, num_joints), dtype=torch.long, device=self._lags.device)
+      return torch.zeros(count, dtype=torch.long, device=self._lags.device)
     return torch.randint(
       self.cfg.delay_min_lag,
       self.cfg.delay_max_lag + 1,
-      (count, num_joints),
+      (count,),
       dtype=torch.long,
       device=self._lags.device,
     )
@@ -187,15 +153,13 @@ class DelayedPdActuator(IdealPdActuator["DelayedPdActuatorCfg"]):
     lags: torch.Tensor | int,
     env_ids: torch.Tensor | slice | None = None,
   ) -> None:
-    """Set delay lag values for specified environments (broadcasting to per-joint shape)."""
+    """Set delay lag values for specified environments. Shape (num_env_ids,) or scalar."""
     if self._lags is None:
       return
     idx: torch.Tensor | slice = slice(None) if env_ids is None else env_ids
     lags_t = torch.as_tensor(lags, dtype=torch.long, device=self._lags.device)
-    if lags_t.ndim == 0:
-      lags_t = lags_t.view(1, 1)
-    elif lags_t.ndim == 1:
-      lags_t = lags_t.unsqueeze(-1)
+    if lags_t.ndim > 1:
+      lags_t = lags_t.squeeze(-1)
     self._lags[idx] = lags_t.clamp(self.cfg.delay_min_lag, self.cfg.delay_max_lag)
 
   def initialize(self, mj_model, model, data, device: str) -> None:
@@ -203,38 +167,20 @@ class DelayedPdActuator(IdealPdActuator["DelayedPdActuatorCfg"]):
     num_envs = data.nworld
     num_joints = len(self._target_names)
 
-    # Precompute semi-implicit inertia/dt gain for velocity_limit_sim enforcement.
     if (
       self.cfg.velocity_limit is not None
       and self.cfg.transmission_type == TransmissionType.JOINT
     ):
+      assert self._target_ids is not None
+      self._joint_v_adrs = self.entity.indexing.joint_v_adr[self._target_ids]
       self.velocity_limit = torch.full(
         (num_envs, num_joints), float(self.cfg.velocity_limit), dtype=torch.float, device=device
       )
-      dt = float(mj_model.opt.timestep)
-      if dt > 0.0:
-        mj_data = mujoco.MjData(mj_model)
-        if mj_model.nkey > 0:
-          mujoco.mj_resetDataKeyframe(mj_model, mj_data, 0)
-        mujoco.mj_forward(mj_model, mj_data)
-        full_mass = np.zeros((mj_model.nv, mj_model.nv), dtype=np.float64)
-        mujoco.mj_fullM(mj_model, mj_data, full_mass)
-        assert self._target_ids is not None
-        v_adrs = self.entity.indexing.joint_v_adr[self._target_ids].detach().cpu().numpy()
-        step_gain_np = np.diag(full_mass)[v_adrs] / dt + mj_model.dof_damping[v_adrs]
-        self.velocity_step_gain = (
-          torch.as_tensor(step_gain_np, dtype=torch.float, device=device)
-          .unsqueeze(0)
-          .expand(num_envs, num_joints)
-          .clone()
-        )
-      else:
-        self.velocity_step_gain = None
     else:
+      self._joint_v_adrs = None
       self.velocity_limit = None
-      self.velocity_step_gain = None
 
-    self._lags = torch.zeros((num_envs, num_joints), dtype=torch.long, device=device)
+    self._lags = torch.zeros(num_envs, dtype=torch.long, device=device)
     if self.has_delay:
       self._history_len = int(self.cfg.delay_max_lag)
       self._cmd_history = torch.zeros(
@@ -246,8 +192,7 @@ class DelayedPdActuator(IdealPdActuator["DelayedPdActuatorCfg"]):
       self._last_sim_time = torch.full(
         (num_envs,), float("nan"), dtype=data.time.dtype, device=device
       )
-      self._env_arange = torch.arange(num_envs, dtype=torch.long, device=device).unsqueeze(-1)
-      self._jnt_arange = torch.arange(num_joints, dtype=torch.long, device=device).unsqueeze(0)
+      self._env_arange = torch.arange(num_envs, dtype=torch.long, device=device)
     self._lags.copy_(self._sample_lags(num_envs))
 
   def apply_delay(self, cmd: ActuatorCmd) -> ActuatorCmd:
@@ -260,15 +205,13 @@ class DelayedPdActuator(IdealPdActuator["DelayedPdActuatorCfg"]):
     assert self._last_cmd is not None
     assert self._last_sim_time is not None
     assert self._env_arange is not None
-    assert self._jnt_arange is not None
 
     stacked = torch.stack((cmd.position_target, cmd.velocity_target, cmd.effort_target), dim=-1)
     sim_time = self.entity.data.data.time
     stepped = self._has_pending & (sim_time > self._last_sim_time)
 
-    env_flat = self._env_arange.squeeze(-1)
-    old_slot = self._cmd_history[env_flat, self._write_idx]
-    self._cmd_history[env_flat, self._write_idx] = torch.where(
+    old_slot = self._cmd_history[self._env_arange, self._write_idx]
+    self._cmd_history[self._env_arange, self._write_idx] = torch.where(
       stepped[:, None, None], self._last_cmd, old_slot
     )
     self._write_idx = (self._write_idx + stepped.to(torch.long)).remainder(self._history_len)
@@ -277,15 +220,30 @@ class DelayedPdActuator(IdealPdActuator["DelayedPdActuatorCfg"]):
     self._last_sim_time.copy_(sim_time)
     self._has_pending.fill_(True)
 
-    read_slots = (self._write_idx.unsqueeze(-1) - self._lags).remainder(self._history_len)
-    delayed_hist = self._cmd_history[self._env_arange, read_slots, self._jnt_arange]
-    delayed = torch.where((self._lags == 0).unsqueeze(-1), stacked, delayed_hist)
+    read_slots = (self._write_idx - self._lags).remainder(self._history_len)
+    delayed_hist = self._cmd_history[self._env_arange, read_slots]
+    delayed = torch.where((self._lags == 0)[:, None, None], stacked, delayed_hist)
     return dataclasses.replace(
       cmd,
       position_target=delayed[..., 0],
       velocity_target=delayed[..., 1],
       effort_target=delayed[..., 2],
     )
+
+  def enforce_velocity_limit(self) -> None:
+    """Clamp controlled joint velocities to ``±velocity_limit`` (``velocity_limit_sim`` parity)."""
+    if self.velocity_limit is None or self._joint_v_adrs is None:
+      return
+    qvel = self.entity.data.data.qvel
+    cur = qvel[:, self._joint_v_adrs]
+    qvel[:, self._joint_v_adrs] = torch.clamp(
+      cur, min=-self.velocity_limit, max=self.velocity_limit
+    )
+
+  def update(self, dt: float) -> None:
+    """Enforce simulation-level ``velocity_limit_sim`` after each ``sim.step()``."""
+    del dt
+    self.enforce_velocity_limit()
 
   def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
     if self._lags is None:
@@ -369,7 +327,10 @@ GO2_PIPER_ACTION_SCALE: dict[str, float] = {
   name: ACTION_SCALE for name in CANONICAL_JOINT_NAMES
 }
 
-# Actuator delay in physics timesteps (dt = 0.005 s -> arm 3..9 = 15..45 ms).
+# Actuator delay in physics timesteps (dt = 0.005 s -> leg 0..6 = 0..30 ms, arm 3..9 = 15..45 ms).
+# LeggedManip_Lab@b2cce16 (go2_piper_articulation_cfg.py) defines 2 leg DelayedPDActuatorCfg
+# groups (leg_hip_thigh, leg_calf -> [0, 6] per-group shared env lag) and 6 separate arm
+# DelayedPDActuatorCfg entries (joint1..joint6 -> [3, 9] independent per-joint env lags).
 DEFAULT_LEG_DELAY_LAG: tuple[int, int] = (0, 6)
 DEFAULT_ARM_DELAY_LAG: tuple[int, int] = (3, 9)
 
