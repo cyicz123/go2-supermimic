@@ -25,7 +25,6 @@ from go2_supermimic.supermimic.world_model import WorldModel
 from go2_supermimic.target import terrain as tr
 from go2_supermimic.wbc import state as wbc_st
 from go2_supermimic.wbc.commands import WbcEePoseCommandCfg
-from go2_supermimic.wbc.env_cfg import wbc_command_curriculum
 from go2_supermimic.wbc.imagine import (
   WBC_STATE_LAYOUT,
   WbcImagineCfg,
@@ -61,6 +60,12 @@ class WbcTrainer:
     self.cfg = cfg
     torch.manual_seed(cfg.seed)
 
+    resume_ckpt = (
+      torch.load(cfg.resume, map_location="cpu", weights_only=False)
+      if cfg.resume
+      else None
+    )
+
     env_cfg = load_env_cfg(cfg.task)
     is_micro_rough = env_cfg.scene.terrain.terrain_type == "generator"
     self.scan_dim = tr.SCAN_POINTS if is_micro_rough else 0
@@ -79,13 +84,43 @@ class WbcTrainer:
 
     env_cfg.scene.num_envs = cfg.num_envs
     env_cfg.seed = cfg.seed
-    for cname in ("base_velocity_levels", "ee_pose_levels"):
-      if cname in env_cfg.curriculum:
-        env_cfg.curriculum[cname].params["end_step"] = cfg.target_curriculum_iterations
+
+    saved_step = 0
+    if resume_ckpt is not None and cfg.continue_run:
+      saved_step = int(
+        resume_ckpt.get("common_step_counter", resume_ckpt.get("iteration", 0))
+      )
+      saved_end_step = int(
+        resume_ckpt.get("cfg", {}).get(
+          "target_curriculum_iterations", cfg.target_curriculum_iterations
+        )
+      )
+      for cname, pkey in (
+        ("base_velocity_levels", "vel_curriculum_progress"),
+        ("ee_pose_levels", "ee_curriculum_progress"),
+      ):
+        if cname in env_cfg.curriculum:
+          params = env_cfg.curriculum[cname].params
+          params["end_step"] = cfg.target_curriculum_iterations
+          if pkey in resume_ckpt and saved_end_step != cfg.target_curriculum_iterations:
+            params["start_step"] = saved_step
+            params["end_step"] = saved_step + max(
+              1, cfg.target_curriculum_iterations - saved_step
+            )
+            params["init_progress"] = float(resume_ckpt[pkey])
+    else:
+      for cname in ("base_velocity_levels", "ee_pose_levels"):
+        if cname in env_cfg.curriculum:
+          env_cfg.curriculum[cname].params["end_step"] = cfg.target_curriculum_iterations
 
     self.env_cfg = env_cfg
     self.env = ManagerBasedRlEnv(cfg=env_cfg, device="cuda:0")
     self.dev = self.env.device
+
+    if resume_ckpt is not None and cfg.continue_run:
+      # Restore common_step_counter and sync command curricula BEFORE the very first reset().
+      self.env.common_step_counter = saved_step
+      self.env.curriculum_manager.compute()
 
     obs, _ = self.env.reset()
     self.obs = obs["actor"]
@@ -181,11 +216,23 @@ class WbcTrainer:
     self.nonfinite_steps = 0
     self.start_it = 0
     self.it = 0
-    if cfg.resume:
-      self.load(cfg.resume)
+    if resume_ckpt is not None:
+      self.load(cfg.resume, ckpt=resume_ckpt)
 
-  def load(self, path: str) -> None:
-    ckpt = torch.load(path, map_location=self.dev, weights_only=False)
+  def load(self, path: str, *, ckpt: dict | None = None) -> None:
+    if ckpt is None:
+      ckpt = torch.load(path, map_location=self.dev, weights_only=False)
+    else:
+      # Move loaded tensors onto target device if peeked on CPU.
+      ckpt = {
+        k: (
+          {sk: sv.to(self.dev) if torch.is_tensor(sv) else sv for sk, sv in v.items()}
+          if isinstance(v, dict)
+          else v
+        )
+        for k, v in ckpt.items()
+      }
+
     wm_sd = self.wm.state_dict()
     same_wm = all(
       k in ckpt["world_model"] and ckpt["world_model"][k].shape == v.shape
@@ -238,23 +285,12 @@ class WbcTrainer:
     if self.cfg.continue_run:
       self.start_it = int(ckpt.get("iteration", 0))
       self.it = self.start_it
-      self.env.common_step_counter = self.start_it
-      # Immediately advance both velocity and EE pose curricula to continued progress
-      # and Stage 1/2 settings before the first rollout step.
-      wbc_command_curriculum(
-        self.env,
-        None,
-        "base_velocity",
-        end_step=self.cfg.target_curriculum_iterations,
-      )
-      wbc_command_curriculum(
-        self.env,
-        None,
-        "ee_pose",
-        end_step=self.cfg.target_curriculum_iterations,
-      )
+      saved_step = int(ckpt.get("common_step_counter", self.start_it))
+      self.env.common_step_counter = saved_step
+      self.env.curriculum_manager.compute()
       print(
-        f"continuing at iteration {self.start_it} (wbc_stage={self.cfg.wbc_stage})",
+        f"continuing at iteration {self.start_it}, common_step_counter={saved_step} "
+        f"(wbc_stage={self.cfg.wbc_stage})",
         flush=True,
       )
 
@@ -421,20 +457,31 @@ class WbcTrainer:
     cfg, b = self.cfg, self.buf
     seed = b.sample_seed(cfg.imag_batch)
     seed["enc_bias"] = self.enc_bias[seed["env"]]
-    for p in self.wm.parameters():
+
+    wm_params = list(self.wm.parameters())
+    crit_params = list(self.critic.parameters())
+    wm_req = [p.requires_grad for p in wm_params]
+    crit_req = [p.requires_grad for p in crit_params]
+    for p in wm_params:
       p.requires_grad_(False)
-    objective, data = self.imag.rollout(self.wm, self.actor, self.critic, seed)
-    loss = -objective.mean()
-    self.opt_actor.zero_grad(set_to_none=True)
-    loss.backward()
-    gnorm = clip_grads(self.actor.parameters(), cfg.grad_clip, cfg.grad_clip_elem)
-    finite = bool(torch.isfinite(gnorm)) and bool(torch.isfinite(loss))
-    if not finite:
-      self.nonfinite_steps += 1
-    if self.it > self.actor_frozen_until and finite:
-      self.opt_actor.step()
-    for p in self.wm.parameters():
-      p.requires_grad_(True)
+    for p in crit_params:
+      p.requires_grad_(False)
+    try:
+      objective, data = self.imag.rollout(self.wm, self.actor, self.critic, seed)
+      loss = -objective.mean()
+      self.opt_actor.zero_grad(set_to_none=True)
+      loss.backward()
+      gnorm = clip_grads(self.actor.parameters(), cfg.grad_clip, cfg.grad_clip_elem)
+      finite = bool(torch.isfinite(gnorm)) and bool(torch.isfinite(loss))
+      if not finite:
+        self.nonfinite_steps += 1
+      if self.it > self.actor_frozen_until and finite:
+        self.opt_actor.step()
+    finally:
+      for p, req in zip(wm_params, wm_req, strict=True):
+        p.requires_grad_(req)
+      for p, req in zip(crit_params, crit_req, strict=True):
+        p.requires_grad_(req)
 
     targets = self.imag.gae_targets(self.critic, data)
     x = data["critic_in"][:, :-1].detach().reshape(-1, data["critic_in"].shape[-1])
@@ -466,12 +513,18 @@ class WbcTrainer:
 
   def save(self, it: int) -> Path:
     path = self.log_dir / f"model_{it}.pt"
+    self.env.curriculum_manager.compute()
+    vel_term = self.env.command_manager.get_term("base_velocity")
+    ee_term = self.env.command_manager.get_term("ee_pose")
     torch.save(
       {
         "supermimic": True,
         "wbc": True,
         "wbc_stage": self.cfg.wbc_stage,
         "iteration": it,
+        "common_step_counter": int(self.env.common_step_counter),
+        "vel_curriculum_progress": float(vel_term.cfg.curriculum_progress),
+        "ee_curriculum_progress": float(ee_term.cfg.curriculum_progress),
         "cfg": asdict(self.cfg),
         "actor": self.actor.state_dict(),
         "critic": self.critic.state_dict(),
@@ -523,6 +576,7 @@ class WbcTrainer:
             f"it {it}/{cfg.iterations}",
             f"{elapsed / 60:.1f} min",
             f"env_steps {self.env_steps / 1e6:.2f}M",
+            f"step_cnt {int(self.env.common_step_counter)}",
           ]
           line += [f"{k_stat} {v_stat:.4g}" for k_stat, v_stat in stats.items()]
           line.append(f"archive {self.archive.size}")

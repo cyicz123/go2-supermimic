@@ -6,8 +6,8 @@ Mirrors the 18-DoF Go2+Piper WBC environment (``go2_supermimic/wbc/env_cfg.py``)
   - True world-frame finite-difference foot velocities use exact terrain height
     under the base at both steps (``ground_z0``, ``ground_z1``).
   - Analytic 6-DoF Piper FK (``piper_fk``) and yaw-invariant ``ee_world_height``
-    provide smooth EE pose tracking and Box-SDF self-collision penetration
-    against ``LINK0_BODY_BOX``.
+    provide smooth EE pose tracking and calibrated MuJoCo AABB self-collision
+    penetration against the battery, base, and head/D415 collision bodies.
   - Deterministic 20D EE trajectory state advances via ``advance_ee_traj_state``
     and 210D actor history is rebuilt via ``wbc_obs_frame`` / ``wbc_push_history``.
 """
@@ -16,11 +16,15 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Literal
 
+import mujoco
+import numpy as np
 import torch
 import torch.nn.functional as F
 
+from go2_supermimic.robot.go2_piper import DEFAULT_JOINT_POS, GO2_PIPER_XML
 from go2_supermimic.supermimic.world_model import StateLayout
 from go2_supermimic.target import terrain as tr
 from go2_supermimic.wbc.commands import (
@@ -53,7 +57,6 @@ from go2_supermimic.wbc.state import (
   WbcRobotConsts,
   _leaky_clamp_ste,
   ee_world_height,
-  piper_collision_radii,
   piper_fk,
   slew_step_arm_diff,
   wbc_apply_pose_delta,
@@ -81,6 +84,105 @@ WBC_CRITIC_BASE_DIM: int = (
 )  # 114
 
 _COLLISION_LINK_ORDER: tuple[str, ...] = tuple(name for name, _ in PIPER_COLLISION_LINK_GEOMS)
+
+_BODY_COLLISION_BOX_GROUPS: tuple[tuple[str, ...], ...] = (
+  ("front_battery_collision_box",),
+  ("base_collision",),
+  ("head_collision1", "head_collision2", "d415_head_camera_collision_camera_main"),
+)
+
+
+@lru_cache(maxsize=4)
+def _compiled_collision_proxy(
+  xml_path: str = str(GO2_PIPER_XML),
+) -> tuple[
+  tuple[tuple[float, float, float], ...],
+  tuple[tuple[float, float, float], ...],
+  tuple[float, ...],
+]:
+  """Extract tight link0-frame body AABBs and link4..ee radii from compiled MJCF."""
+  mj_model = mujoco.MjSpec.from_file(xml_path).compile()
+  mj_data = mujoco.MjData(mj_model)
+  mj_data.qpos[7:] = DEFAULT_JOINT_POS
+  mujoco.mj_forward(mj_model, mj_data)
+
+  l0_bid = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_BODY, "link0")
+  if l0_bid < 0:
+    raise ValueError(f"Missing body 'link0' in {xml_path}")
+  l0_pos = mj_data.xpos[l0_bid]
+  l0_mat = mj_data.xmat[l0_bid].reshape(3, 3)
+
+  box_mins: list[tuple[float, float, float]] = []
+  box_maxs: list[tuple[float, float, float]] = []
+  for geom_group in _BODY_COLLISION_BOX_GROUPS:
+    grp_mins, grp_maxs = [], []
+    for gname in geom_group:
+      gid = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_GEOM, gname)
+      if gid < 0:
+        raise ValueError(f"Missing body collision geom '{gname}' in {xml_path}")
+      p_w = mj_data.geom_xpos[gid]
+      r_w = mj_data.geom_xmat[gid].reshape(3, 3)
+      p_l0 = l0_mat.T @ (p_w - l0_pos)
+      r_l0 = l0_mat.T @ r_w
+      gtype = int(mj_model.geom_type[gid])
+      if gtype == int(mujoco.mjtGeom.mjGEOM_BOX):
+        ext = np.abs(r_l0) @ mj_model.geom_size[gid]
+        grp_mins.append(p_l0 - ext)
+        grp_maxs.append(p_l0 + ext)
+      elif gtype == int(mujoco.mjtGeom.mjGEOM_MESH):
+        mid = int(mj_model.geom_dataid[gid])
+        adr = int(mj_model.mesh_vertadr[mid])
+        num = int(mj_model.mesh_vertnum[mid])
+        verts = mj_model.mesh_vert[adr : adr + num]
+        pts = (verts @ r_l0.T) + p_l0
+        grp_mins.append(pts.min(axis=0))
+        grp_maxs.append(pts.max(axis=0))
+      else:
+        ext = np.full(3, float(mj_model.geom_rbound[gid]), dtype=np.float64)
+        grp_mins.append(p_l0 - ext)
+        grp_maxs.append(p_l0 + ext)
+    bmin = np.min(grp_mins, axis=0)
+    bmax = np.max(grp_maxs, axis=0)
+    box_mins.append(tuple(float(v) for v in bmin))
+    box_maxs.append(tuple(float(v) for v in bmax))
+
+  # Tight principal half-extent radii (instead of inflated diagonal rbound)
+  # for link4/link5, 0.035 m wrist hub radius covering link6+gripper_base, and
+  # exact 0.020 m sphere radius for end_effector.
+  radii: list[float] = []
+  for link_name, gname in PIPER_COLLISION_LINK_GEOMS:
+    gid = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_GEOM, gname)
+    gtype = int(mj_model.geom_type[gid])
+    if gtype == int(mujoco.mjtGeom.mjGEOM_SPHERE):
+      radii.append(float(mj_model.geom_size[gid, 0]))
+    elif link_name == "link6":
+      radii.append(0.035)
+    elif gtype == int(mujoco.mjtGeom.mjGEOM_MESH):
+      mid = int(mj_model.geom_dataid[gid])
+      adr = int(mj_model.mesh_vertadr[mid])
+      num = int(mj_model.mesh_vertnum[mid])
+      verts = mj_model.mesh_vert[adr : adr + num]
+      half_ext = 0.5 * (verts.max(axis=0) - verts.min(axis=0))
+      radii.append(float(half_ext.mean()))
+    else:
+      radii.append(float(mj_model.geom_rbound[gid]))
+  return tuple(box_mins), tuple(box_maxs), tuple(radii)
+
+
+def piper_body_aabbs_link0(
+  xml_path: str = str(GO2_PIPER_XML),
+) -> tuple[tuple[tuple[float, float, float], ...], tuple[tuple[float, float, float], ...]]:
+  """Tight compiled MuJoCo AABBs ``(mins, maxs)`` in ``link0`` frame for battery, base, head/D415."""
+  bmin, bmax, _ = _compiled_collision_proxy(xml_path)
+  return bmin, bmax
+
+
+def piper_tight_collision_radii(
+  xml_path: str = str(GO2_PIPER_XML),
+) -> dict[str, float]:
+  """Tight principal collision radii for ``link4..end_effector`` calibrated from compiled MJCF."""
+  _, _, rad = _compiled_collision_proxy(xml_path)
+  return dict(zip(_COLLISION_LINK_ORDER, rad, strict=True))
 
 
 def safe_norm(x: torch.Tensor, eps: float = 1e-6, dim: int = -1) -> torch.Tensor:
@@ -123,21 +225,31 @@ def soft_contact_prob(
 def box_sdf_penetration(
   points: torch.Tensor,
   radii: torch.Tensor,
-  box_min: tuple[float, float, float] = LINK0_BODY_BOX_MIN,
-  box_max: tuple[float, float, float] = LINK0_BODY_BOX_MAX,
+  box_min: torch.Tensor | tuple[float, ...] = LINK0_BODY_BOX_MIN,
+  box_max: torch.Tensor | tuple[float, ...] = LINK0_BODY_BOX_MAX,
 ) -> torch.Tensor:
-  """Differentiable sphere-vs-AABB penetration depth ``relu(r - sdf)``.
+  """Differentiable sphere-vs-AABB(s) penetration depth ``relu(r - min_m sdf_m)``.
 
+  Accepts either a single box ``(3,)`` or a union of ``M`` boxes ``(M, 3)``.
   Returns ``0.0`` strictly outside ``box + radius``, and increases smoothly
-  inside ``box + radius`` with gradient pushing spheres away from the box.
+  inside ``box + radius`` with gradient pushing spheres away from the nearest box.
   ``points`` has shape ``(..., K, 3)`` and ``radii`` has shape ``(K,)``.
   """
-  bmin = points.new_tensor(box_min)
-  bmax = points.new_tensor(box_max)
+  bmin = (
+    box_min.to(device=points.device, dtype=points.dtype)
+    if torch.is_tensor(box_min)
+    else points.new_tensor(box_min)
+  )
+  bmax = (
+    box_max.to(device=points.device, dtype=points.dtype)
+    if torch.is_tensor(box_max)
+    else points.new_tensor(box_max)
+  )
+  multi = bmin.ndim == 2
+  pts = points.unsqueeze(-2) if multi else points
   center = 0.5 * (bmin + bmax)
   half = 0.5 * (bmax - bmin)
-  # Smooth abs avoids non-differentiable kink at the box center.
-  d = torch.sqrt((points - center).square() + 1e-8) - half
+  d = torch.sqrt((pts - center).square() + 1e-8) - half
   outside = torch.sqrt(F.relu(d).square().sum(dim=-1) + 1e-12) - 1e-6
   u = F.relu(-d)
   ux, uy, uz = u.unbind(dim=-1)
@@ -145,6 +257,8 @@ def box_sdf_penetration(
   den = torch.sqrt((ux * uy).square() + (uy * uz).square() + (uz * ux).square() + 1e-16)
   inside = -(num / den)
   sdf = outside + inside
+  if multi:
+    sdf = sdf.amin(dim=-1)
   return F.relu(radii - sdf)
 
 
@@ -238,13 +352,11 @@ class WbcImagination:
     self.field = field
     self.critic_dim = WBC_CRITIC_BASE_DIM + self.scan_dim
 
-    radii_map = piper_collision_radii()
+    box_mins, box_maxs, radii = _compiled_collision_proxy()
     with torch.inference_mode(False):
-      self._col_radii = torch.tensor(
-        [radii_map[name] for name in _COLLISION_LINK_ORDER],
-        device=self.device,
-        dtype=torch.float32,
-      )
+      self._col_box_min = torch.tensor(box_mins, device=self.device, dtype=torch.float32)
+      self._col_box_max = torch.tensor(box_maxs, device=self.device, dtype=torch.float32)
+      self._col_radii = torch.tensor(radii, device=self.device, dtype=torch.float32)
       self._col_baseline = float(
         torch.sigmoid(torch.tensor(-cfg.col_pen_margin / cfg.col_tau)).item()
       )
@@ -347,9 +459,9 @@ class WbcImagination:
     return p_contact, z_foot, v_foot_xy_w, v_foot_xy_norm
 
   def collision_penetration(self, fk: PiperFkResult) -> torch.Tensor:
-    """Per-link Box-SDF penetration depths ``(..., 4)`` for ``link4..end_effector``."""
+    """Per-link tight Box-SDF penetration depths ``(..., 4)`` for ``link4..end_effector``."""
     pts = torch.stack([fk.link_pos_link0[name] for name in _COLLISION_LINK_ORDER], dim=-2)
-    return box_sdf_penetration(pts, self._col_radii)
+    return box_sdf_penetration(pts, self._col_radii, self._col_box_min, self._col_box_max)
 
   def termination_prob(
     self,
@@ -642,7 +754,7 @@ class WbcImagination:
     critic,
     seed: dict[str, torch.Tensor],
   ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Imagine H steps from WBC replay seeds; return objective and critic data."""
+    """Imagine H steps from WBC replay seeds; freeze wm/critic params while keeping input grads."""
     cfg = self.cfg
     B = seed["s"].shape[0]
     env_ids = seed["env"]
@@ -667,66 +779,84 @@ class WbcImagination:
     dt = torch.full((B,), cfg.dt, device=self.device, dtype=s.dtype)
     k = self.rollout_constants(env_ids)
 
-    surv = torch.ones(B, device=self.device, dtype=s.dtype)
-    ret = torch.zeros(B, device=self.device, dtype=s.dtype)
-    disc = 1.0
-    rewards, survs, crit_in = [], [], []
-    for _ in range(cfg.horizon):
-      survs.append(surv)
-      (
-        s,
-        pose,
-        a_prev,
-        q_ref_arm,
-        hist,
-        ee_pose_cmd,
-        traj_state,
-        r,
-        d,
-        x,
-      ) = self._step_fn(
-        s,
-        pose,
-        a_prev,
-        q_ref_arm,
-        hist,
-        cmd_vel,
-        ee_pose_cmd,
-        traj_state,
-        xi,
-        enc_bias,
-        k,
-        dt,
-        actor,
-        wm,
-      )
-      crit_in.append(x)
-      ret = ret + disc * surv * r
-      rewards.append(r)
-      surv = surv * (1.0 - d)
-      disc *= cfg.gamma
+    wm_params = list(wm.parameters())
+    crit_params = list(critic.parameters())
+    wm_req = [p.requires_grad for p in wm_params]
+    crit_req = [p.requires_grad for p in crit_params]
+    for p in wm_params:
+      p.requires_grad_(False)
+    for p in crit_params:
+      p.requires_grad_(False)
 
-    x_H = self.critic_input(s, pose, q_ref_arm, cmd_vel, ee_pose_cmd, xi, k)
-    v_H = critic(x_H).squeeze(-1)
-    objective = ret + disc * surv * v_H
-    return objective, {
-      "rewards": torch.stack(rewards, dim=1),
-      "surv": torch.stack(survs + [surv], dim=1),
-      "critic_in": torch.stack(crit_in + [x_H], dim=1),
-    }
+    try:
+      surv = torch.ones(B, device=self.device, dtype=s.dtype)
+      ret = torch.zeros(B, device=self.device, dtype=s.dtype)
+      disc = 1.0
+      rewards, survs, conts, crit_in = [], [], [], []
+      for _ in range(cfg.horizon):
+        survs.append(surv)
+        (
+          s,
+          pose,
+          a_prev,
+          q_ref_arm,
+          hist,
+          ee_pose_cmd,
+          traj_state,
+          r,
+          d,
+          x,
+        ) = self._step_fn(
+          s,
+          pose,
+          a_prev,
+          q_ref_arm,
+          hist,
+          cmd_vel,
+          ee_pose_cmd,
+          traj_state,
+          xi,
+          enc_bias,
+          k,
+          dt,
+          actor,
+          wm,
+        )
+        crit_in.append(x)
+        ret = ret + disc * surv * r
+        rewards.append(r)
+        c_t = 1.0 - d
+        conts.append(c_t)
+        surv = surv * c_t
+        disc *= cfg.gamma
+
+      x_H = self.critic_input(s, pose, q_ref_arm, cmd_vel, ee_pose_cmd, xi, k)
+      v_H = critic(x_H).squeeze(-1)
+      objective = ret + disc * surv * v_H
+      return objective, {
+        "rewards": torch.stack(rewards, dim=1),
+        "cont": torch.stack(conts, dim=1),
+        "surv": torch.stack(survs + [surv], dim=1),
+        "critic_in": torch.stack(crit_in + [x_H], dim=1),
+      }
+    finally:
+      for p, req in zip(wm_params, wm_req, strict=True):
+        p.requires_grad_(req)
+      for p, req in zip(crit_params, crit_req, strict=True):
+        p.requires_grad_(req)
 
   @torch.no_grad()
   def gae_targets(self, critic, data: dict[str, torch.Tensor]) -> torch.Tensor:
-    """TD(lambda) returns over the imagined steps (SuperMimic Eq. 3)."""
+    """TD(lambda) returns over the imagined steps using exact per-step ``cont = 1 - d_t``."""
     cfg = self.cfg
     r = data["rewards"].detach()
-    surv = data["surv"].detach()
+    cont = data["cont"].detach()
     v = critic(data["critic_in"].detach()).squeeze(-1)
     H = r.shape[1]
     targets = torch.zeros_like(r)
     nxt = v[:, H]
     for t in reversed(range(H)):
-      cont = surv[:, t + 1] / surv[:, t].clamp(min=1e-6)
-      nxt = r[:, t] + cfg.gamma * cont * ((1.0 - cfg.lam) * v[:, t + 1] + cfg.lam * nxt)
+      c_t = cont[:, t]
+      nxt = r[:, t] + cfg.gamma * c_t * ((1.0 - cfg.lam) * v[:, t + 1] + cfg.lam * nxt)
       targets[:, t] = nxt
     return targets

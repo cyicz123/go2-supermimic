@@ -1,6 +1,6 @@
 """Phase 2C tests: differentiable WBC imagination, rewards, soft termination,
 32-step BPTT gradients, Critic 114D/191D inputs, TorchScript export parity,
-task registration, and MicroRough end-to-end pipeline verification.
+task registration, curriculum clock resume, and MicroRough pipeline verification.
 """
 
 from __future__ import annotations
@@ -10,17 +10,18 @@ import subprocess
 import sys
 from pathlib import Path
 
+import mujoco
 import pytest
 import torch
+from torch import nn
 
-from go2_supermimic.supermimic.buffer import WbcReplayBuffer
+from go2_supermimic.robot.go2_piper import DEFAULT_JOINT_POS, GO2_PIPER_XML
 from go2_supermimic.supermimic.train import Actor, Critic, TrainCfg
 from go2_supermimic.supermimic.world_model import WorldModel
 from go2_supermimic.target.terrain import SCAN_POINTS, HeightField
 from go2_supermimic.wbc import (
   LINK0_BODY_BOX_MAX,
   LINK0_BODY_BOX_MIN,
-  TRAJ_STATE_DIM,
   WBC_ACTOR_OBS_DIM,
   WBC_CONTEXT_DIM,
   WBC_CRITIC_BASE_DIM,
@@ -33,7 +34,6 @@ from go2_supermimic.wbc import (
   WBC_STATE_LAYOUT,
   WbcImagineCfg,
   WbcImagination,
-  WbcRewardWeights,
   WbcRobotConsts,
   box_sdf_penetration,
   export_wbc_actor_torchscript,
@@ -133,10 +133,11 @@ def _make_rollout_seed(
   consts: WbcRobotConsts,
   *,
   stage2_traj: bool = False,
+  q_arm: tuple[float, ...] = (0.0, 0.6, -0.7, 0.0, 0.3, 0.0),
 ) -> dict[str, torch.Tensor]:
   dev = torch.device(device)
   s0 = _make_standing_state(batch, dev, base_z=0.31, feet_z_rel_ground=0.015)
-  s0[:, wbc_st.Q_ARM] = torch.tensor([0.0, 0.6, -0.7, 0.0, 0.3, 0.0], device=dev)
+  s0[:, wbc_st.Q_ARM] = torch.tensor(q_arm, device=dev, dtype=torch.float32)
   pose0 = torch.zeros((batch, 3), device=dev)
   a_prev0 = torch.zeros((batch, WBC_NUM_JOINTS), device=dev)
   q_ref_arm0 = s0[:, wbc_st.Q_ARM].clone()
@@ -187,7 +188,7 @@ def _make_rollout_seed(
 
 
 # ---------------------------------------------------------------------------
-# 1. 32-step BPTT full-parameter finite non-zero gradient gate
+# 1. 32-step BPTT full-parameter finite non-zero gradient gate + P1 #2 freeze
 # ---------------------------------------------------------------------------
 
 
@@ -221,8 +222,6 @@ def test_32step_bptt_all_actor_params_finite_nonzero_grads(
     z_slice=wbc_st.Z,
     state_slices=WBC_STATE_LAYOUT,
   ).to(device)
-  for p in wm.parameters():
-    p.requires_grad_(False)
 
   imag = WbcImagination(
     WbcImagineCfg(horizon=32, obs_noise=False, sensor_grad=True),
@@ -236,20 +235,36 @@ def test_32step_bptt_all_actor_params_finite_nonzero_grads(
   actor = Actor(WBC_ACTOR_OBS_DIM, (128, 64), WBC_NUM_JOINTS).to(device)
   critic = Critic(imag.critic_dim, (128, 64)).to(device)
 
+  # P1 #2: Leave wm and critic requires_grad=True before rollout; rollout must freeze
+  # both parameter sets (no .grad written) while preserving critic input gradients to actor.
+  assert all(p.requires_grad for p in wm.parameters())
+  assert all(p.requires_grad for p in critic.parameters())
+
   seed = _make_rollout_seed(B, device, consts, stage2_traj=stage2_traj)
   objective, data = imag.rollout(wm, actor, critic, seed)
   assert objective.shape == (B,)
   assert data["rewards"].shape == (B, 32)
+  assert data["cont"].shape == (B, 32)
   assert data["surv"].shape == (B, 33)
   assert data["critic_in"].shape == (B, 33, imag.critic_dim)
   assert torch.isfinite(objective).all()
   assert torch.isfinite(data["rewards"]).all()
+  assert torch.isfinite(data["cont"]).all()
   assert torch.isfinite(data["surv"]).all()
   assert torch.isfinite(data["critic_in"]).all()
 
   loss = -objective.mean()
   actor.zero_grad(set_to_none=True)
+  critic.zero_grad(set_to_none=True)
+  wm.zero_grad(set_to_none=True)
   loss.backward()
+
+  for name, p in critic.named_parameters():
+    assert p.grad is None, f"Critic param {name} should not receive grad during actor backward"
+    assert p.requires_grad is True
+  for name, p in wm.named_parameters():
+    assert p.grad is None, f"WM param {name} should not receive grad during actor backward"
+    assert p.requires_grad is True
 
   for name, p in actor.named_parameters():
     assert p.grad is not None, f"Missing grad for {name}"
@@ -266,7 +281,7 @@ def test_32step_bptt_all_actor_params_finite_nonzero_grads(
 
 
 # ---------------------------------------------------------------------------
-# 2. Differentiable rewards, B1 wz gating, Box-SDF, soft termination, Critic
+# 2. Differentiable rewards, B1 wz gating, calibrated collision proxy, P1 #1/#3
 # ---------------------------------------------------------------------------
 
 
@@ -284,10 +299,8 @@ def test_soft_contact_world_fd_slide_and_heightfield() -> None:
   s0 = _make_standing_state(2, "cpu", base_z=0.30, feet_z_rel_ground=0.032)
   s1 = _make_standing_state(2, "cpu", base_z=0.30, feet_z_rel_ground=0.032)
 
-  # Match exact formula sigmoid((0.032 - z_foot) / 0.006)
   p_c, z_foot, v_xy_w, _ = imag.soft_contact_and_foot_vel(s0, pose0, s1, pose1, 0.02)
   assert torch.allclose(p_c, soft_contact_prob(z_foot, 0.032, 0.006), atol=1e-6)
-  # Env 0 moved +0.1 m in X over 0.02 s -> v_foot_x_w = 5.0 m/s
   assert torch.allclose(v_xy_w[0, :, 0], torch.full((4,), 5.0), atol=1e-4)
   assert torch.allclose(v_xy_w[1], torch.zeros(4, 2), atol=1e-5)
 
@@ -300,13 +313,11 @@ def test_gait_wz_gating_standing_5x_and_reward_terms() -> None:
   pose1 = torch.zeros(3, 3)
   s0 = _make_standing_state(3, "cpu", base_z=0.30, feet_z_rel_ground=0.01)
   s1 = _make_standing_state(3, "cpu", base_z=0.30, feet_z_rel_ground=0.01)
-  # Lift foot 0 to z=0.04 m (below clearance target 0.06 m) and give it horizontal speed
   s1[:, wbc_st.FEET.start + 0] += 0.02
   s1[:, wbc_st.FEET.start + 2] += 0.03
   s1[:, wbc_st.Q_LEG] = 0.1
   s1[:, wbc_st.QD_ARM] = torch.tensor([[2.0] * 6, [3.05] * 6, [0.0] * 6])
 
-  # Env 0: standing; Env 1: linear moving; Env 2: pure in-place yaw turning (wz != 0)
   cmd_vel = torch.tensor([[0.0, 0.0, 0.0], [0.5, 0.0, 0.0], [0.0, 0.0, 0.8]])
   a = torch.zeros(3, WBC_NUM_JOINTS)
   a_prev = torch.zeros(3, WBC_NUM_JOINTS)
@@ -318,31 +329,27 @@ def test_gait_wz_gating_standing_5x_and_reward_terms() -> None:
 
   _, terms = imag.compute_rewards(s0, s1, pose0, pose1, a, a_prev, q_ref_arm, cmd_vel, ee_cmd, xi, k)
 
-  # B1 wz gating: clearance active for env 1 (vx) and env 2 (pure wz), 0 for env 0 (standing)
   assert terms["feet_clearance_soft"][0].item() == pytest.approx(0.0, abs=1e-7)
   assert terms["feet_clearance_soft"][1].item() > 0.0
   assert terms["feet_clearance_soft"][2].item() > 0.0
 
-  # standing_feet_air_soft active only for standing env 0
   assert terms["standing_feet_air_soft"][0].item() > 0.0
   assert terms["standing_feet_air_soft"][1].item() == pytest.approx(0.0, abs=1e-7)
   assert terms["standing_feet_air_soft"][2].item() == pytest.approx(0.0, abs=1e-7)
 
-  # leg_joint_pos 5x weight on standing env 0 vs moving envs 1, 2
   assert terms["leg_joint_pos"][0].item() / terms["leg_joint_pos"][1].item() == pytest.approx(
     5.0, rel=1e-5
   )
 
-  # arm_vel_hinge (> 2.85 rad/s): 0 for 2.0 and 0.0; >0 for 3.05
   assert terms["arm_vel_hinge"][0].item() == pytest.approx(0.0, abs=1e-7)
   assert terms["arm_vel_hinge"][1].item() > 0.0
   assert terms["arm_vel_hinge"][2].item() == pytest.approx(0.0, abs=1e-7)
 
-  # joint_torques_l2 / joint_power use q_ref_arm (0.25) instead of default_arm + scale*a_arm (0.0)
-  expected_arm_tau = (k["kp"][12:] * 0.25).clamp(-k["effort"][12:], k["effort"][12:]).square().sum().item()
+  expected_arm_tau = (
+    (k["kp"][12:] * 0.25).clamp(-k["effort"][12:], k["effort"][12:]).square().sum().item()
+  )
   assert terms["joint_torques_l2"][0].item() >= expected_arm_tau - 1e-3
 
-  # Quaternion geodesic angle sign invariance and smoothness at 0 and pi
   q_id = torch.tensor([[1.0, 0.0, 0.0, 0.0]], requires_grad=True)
   q_anti = torch.tensor([[-1.0, 0.0, 0.0, 0.0]])
   q_pi = torch.tensor([[0.0, 1.0, 0.0, 0.0]])
@@ -355,46 +362,148 @@ def test_gait_wz_gating_standing_5x_and_reward_terms() -> None:
 
 
 def test_self_collision_box_sdf_and_soft_termination_and_critic_dim() -> None:
-  consts = _synthetic_consts(2, "cpu")
-  imag = WbcImagination(WbcImagineCfg(), consts, "cpu")
+  consts = _synthetic_consts(3, "cpu")
+  imag = WbcImagination(WbcImagineCfg(horizon=32, obs_noise=False), consts, "cpu")
 
-  # Outside box + radius -> exact 0; inside box -> > 0 and -grad pushes outward
+  # Direct Box-SDF check: outside -> 0.0, inside -> > 0 and -grad pushes outward
   bmax = torch.tensor(LINK0_BODY_BOX_MAX)
   bmin = torch.tensor(LINK0_BODY_BOX_MIN)
   outside_pt = (bmax + torch.tensor([0.3, 0.3, 0.3])).view(1, 1, 3)
-  inside_pt = (0.5 * (bmin + bmax) + torch.tensor([0.05, 0.0, 0.0])).view(1, 1, 3).requires_grad_(True)
+  inside_pt = (
+    (0.5 * (bmin + bmax) + torch.tensor([0.05, 0.0, 0.0]))
+    .view(1, 1, 3)
+    .requires_grad_(True)
+  )
   r = torch.tensor([0.05])
   assert box_sdf_penetration(outside_pt, r).item() == 0.0
   pen_in = box_sdf_penetration(inside_pt, r)
   assert pen_in.item() > 0.05
   (-pen_in).backward()
   assert inside_pt.grad is not None and torch.isfinite(inside_pt.grad).all()
-  # Gradient of (-pen) should push toward nearest face (+z or +x) away from center
   assert inside_pt.grad[0, 0, 0].item() > 0.0
 
-  # Test FK + termination_prob union bounds [0, 1] and 0 baseline at zero collision
-  q_safe = torch.tensor([[0.0, 1.2, -0.5, 0.0, 0.0, 0.0], [0.0, 0.1, -0.1, 0.0, 0.0, 0.0]])
-  fk = piper_fk(q_safe)
-  s = _make_standing_state(2, "cpu", base_z=0.30)
+  # P1 #1: Verify real MuJoCo safe poses (q_arm=0 & safe workspace) have ZERO false penetration
+  # and real Phase 2A battery/base/D415 self-collision poses have > 0 penetration & push-out grad.
+  mj_model = mujoco.MjSpec.from_file(str(GO2_PIPER_XML)).compile()
+  mj_data = mujoco.MjData(mj_model)
+  battery_hit = None
+  base_hit = None
+  for j2 in (1.4, 1.8, 2.2, 2.6):
+    for j3 in (-0.2, -0.7, -1.2, -2.0, -2.7):
+      for j5 in (-1.2, 0.0, 1.2):
+        arm_pose = [0.0, j2, j3, 0.0, j5, 0.0]
+        mujoco.mj_resetData(mj_model, mj_data)
+        mj_data.qpos[2] = 0.35
+        mj_data.qpos[3] = 1.0
+        mj_data.qpos[7:25] = list(DEFAULT_JOINT_POS[:12]) + arm_pose
+        mujoco.mj_forward(mj_model, mj_data)
+        for c in range(mj_data.ncon):
+          g1 = mujoco.mj_id2name(mj_model, mujoco.mjtObj.mjOBJ_GEOM, mj_data.contact[c].geom1)
+          g2 = mujoco.mj_id2name(mj_model, mujoco.mjtObj.mjOBJ_GEOM, mj_data.contact[c].geom2)
+          pair = {g1, g2}
+          if "front_battery_collision_box" in pair and mj_data.contact[c].dist < -0.002 and battery_hit is None:
+            battery_hit = arm_pose
+          if (
+            {"base_collision", "head_collision1", "d415_head_camera_collision_camera_main"} & pair
+            and {"link4_collision", "link5_collision", "link6_collision", "end_effector_collision"} & pair
+            and mj_data.contact[c].dist < -0.002
+            and base_hit is None
+          ):
+            base_hit = arm_pose
+  assert battery_hit is not None and base_hit is not None
+
+  q_safe_0 = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  q_safe_work = [0.2, 1.57, -1.35, -0.3, -0.5, 0.4]
+  q_batch = torch.tensor([q_safe_0, q_safe_work, battery_hit], dtype=torch.float32, requires_grad=True)
+  fk = piper_fk(q_batch)
+  s = _make_standing_state(3, "cpu", base_z=0.30)
   d, pens, (d_ori, d_base, d_col) = imag.termination_prob(s, fk)
   assert (d >= 0.0).all() and (d <= 1.0).all()
   assert (d_ori >= 0.0).all() and (d_base >= 0.0).all() and (d_col >= 0.0).all()
-  # Safe pose outside LINK0_BODY_BOX has zero penetration & zero d_col baseline pollution
-  if pens[0].max().item() == 0.0:
-    assert d_col[0].item() == pytest.approx(0.0, abs=1e-7)
 
-  # Critic input dimension 114D flat / 191D micro-rough
-  k = imag.rollout_constants(torch.arange(2))
+  # Unconditional assertions: q_arm = 0 and safe workspace have exact zero penetration and d_col < 1e-4
+  assert pens[0].sum().item() == 0.0
+  assert pens[1].sum().item() == 0.0
+  assert d_col[0].item() < 1e-4
+  assert d_col[1].item() < 1e-4
+
+  # Real battery & base collision poses must register positive penetration and elevated d_col
+  assert pens[2].sum().item() > 0.0
+  assert d_col[2].item() > 0.01
+
+  # Also check base_hit explicitly
+  q_base_t = torch.tensor([base_hit], dtype=torch.float32, requires_grad=True)
+  pens_base = imag.collision_penetration(piper_fk(q_base_t))
+  assert pens_base.sum().item() > 0.0
+
+  # Gradient ascent on -penetration must reduce penetration when stepping q_arm
+  pen_before = float(pens[2].sum().item())
+  (-pens[2].sum()).backward()
+  assert q_batch.grad is not None and torch.isfinite(q_batch.grad[2]).all()
+  g = q_batch.grad[2].detach()
+  assert g.norm().item() > 0.0
+  q_nudged = torch.tensor([battery_hit], dtype=torch.float32) + 1e-3 * (g / g.norm())
+  pen_after = float(imag.collision_penetration(piper_fk(q_nudged)).sum().item())
+  assert pen_after < pen_before
+
+  # 32-step default q_arm=0 rollout survival must be >= 0.99 (> 0.95)
+  class _StandingIdentityWM(nn.Module):
+    def forward(self, s, a, a_prev, xi, relief=None, q_ref_arm=None):
+      del a, a_prev, xi, relief, q_ref_arm
+      return s, torch.zeros(s.shape[0], 3, device=s.device, dtype=s.dtype)
+
+  consts1 = _synthetic_consts(2, "cpu")
+  seed0 = _make_rollout_seed(2, "cpu", consts1, stage2_traj=False, q_arm=(0.0,) * 6)
+  seed0["s"][:, 0] = 0.30
+  actor = Actor(WBC_ACTOR_OBS_DIM, (64, 32), WBC_NUM_JOINTS)
+  critic = Critic(imag.critic_dim, (64, 32))
+  _, rollout_data = imag.rollout(_StandingIdentityWM(), actor, critic, seed0)
+  assert float(rollout_data["surv"][:, -1].min().item()) >= 0.99
+
+  # Critic input dimension 114D flat
+  k = imag.rollout_constants(torch.arange(3))
   crit = imag.critic_input(
     s,
-    torch.zeros(2, 3),
-    torch.zeros(2, 6),
-    torch.zeros(2, 3),
-    torch.zeros(2, 7),
-    torch.ones(2, 9),
+    torch.zeros(3, 3),
+    torch.zeros(3, 6),
+    torch.zeros(3, 3),
+    torch.zeros(3, 7),
+    torch.ones(3, 9),
     k,
   )
-  assert crit.shape == (2, 114)
+  assert crit.shape == (3, 114)
+
+
+def test_gae_targets_uses_exact_continuation_without_surv_clamp() -> None:
+  """P1 #3: When surv_t drops to 1e-8 and subsequent d_t == 0, local continuation is 1.0."""
+  consts = _synthetic_consts(1, "cpu")
+  cfg = WbcImagineCfg(horizon=4, gamma=0.99, lam=0.95)
+  imag = WbcImagination(cfg, consts, "cpu")
+
+  class _ConstCritic(nn.Module):
+    def forward(self, x):
+      return torch.full((*x.shape[:-1], 1), 2.0, device=x.device, dtype=x.dtype)
+
+  critic = _ConstCritic()
+  rewards = torch.tensor([[1.0, 0.5, 0.25, 0.125]], dtype=torch.float32)
+  # Step 0 kills survival down to 1e-8 (d_0 = 1 - 1e-8); steps 1..3 have d_t = 0 -> cont_t = 1.0
+  cont = torch.tensor([[1e-8, 1.0, 1.0, 1.0]], dtype=torch.float32)
+  surv = torch.tensor([[1.0, 1e-8, 1e-8, 1e-8, 1e-8]], dtype=torch.float32)
+  data = {
+    "rewards": rewards,
+    "cont": cont,
+    "surv": surv,
+    "critic_in": torch.zeros((1, 5, imag.critic_dim), dtype=torch.float32),
+  }
+  targets = imag.gae_targets(critic, data)
+
+  # Analytical TD(lambda) with exact per-step cont_t
+  expected = torch.zeros_like(rewards)
+  nxt = torch.tensor(2.0)
+  for t in reversed(range(4)):
+    nxt = rewards[0, t] + cfg.gamma * cont[0, t] * ((1.0 - cfg.lam) * 2.0 + cfg.lam * nxt)
+    expected[0, t] = nxt
+  assert torch.allclose(targets, expected, atol=1e-6)
 
 
 # ---------------------------------------------------------------------------
@@ -453,7 +562,7 @@ def test_torchscript_export_parity_and_cli(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 4. Task registration & MicroRough scan_dim=77 GPU trainer smoke test
+# 4. Task registration, P1 #4 resume curriculum clock, & MicroRough GPU smoke
 # ---------------------------------------------------------------------------
 
 
@@ -481,6 +590,110 @@ def test_task_registration_and_defaults() -> None:
   chase_defaults = TrainCfg()
   assert chase_defaults.explore_frac == 0.25
   assert chase_defaults.explore_noise == 0.3
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA GPU")
+def test_resume_restores_common_step_counter_and_curriculum_before_first_reset(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+  """P1 #4: Resume must restore common_step_counter and command curricula BEFORE first reset()."""
+  from mjlab.envs import ManagerBasedRlEnv
+
+  cfg1 = WbcTrainCfg(
+    task="Go2Piper-WBC-Flat",
+    num_envs=8,
+    buffer_len=32,
+    iterations=2,
+    warmup_iterations=0,
+    wm_window=4,
+    wm_batch=16,
+    wm_updates=1,
+    imag_batch=8,
+    horizon=4,
+    wm_hidden=(64, 64),
+    actor_hidden=(64, 32),
+    critic_hidden=(64, 32),
+    critic_epochs=1,
+    critic_minibatches=2,
+    target_curriculum_iterations=100,
+    wbc_stage=1,
+    log_interval=10,
+    save_interval=2,
+    log_root=str(tmp_path),
+    run_name="p1_4_stage1",
+  )
+  t1 = WbcTrainer(cfg1)
+  t1.run()
+  ckpt_path = next(tmp_path.glob("*_p1_4_stage1/model_2.pt"))
+  ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+  saved_step = int(ckpt["common_step_counter"])
+  saved_vel_p = float(ckpt["vel_curriculum_progress"])
+  saved_ee_p = float(ckpt["ee_curriculum_progress"])
+  # wm_window=4 -> 6 warmup collects + 2 iteration collects = 8 env steps (> iter=2)
+  assert saved_step == 8
+  assert saved_vel_p == pytest.approx(8.0 / 100.0, rel=1e-5)
+  assert saved_ee_p == pytest.approx(8.0 / 100.0, rel=1e-5)
+
+  seen_at_first_reset: list[tuple[int, float, float, int]] = []
+  orig_reset = ManagerBasedRlEnv.reset
+
+  def _spy_reset(self, *args, **kwargs):
+    if not seen_at_first_reset:
+      vel_t = self.command_manager.get_term("base_velocity")
+      ee_t = self.command_manager.get_term("ee_pose")
+      seen_at_first_reset.append(
+        (
+          int(self.common_step_counter),
+          float(vel_t.cfg.curriculum_progress),
+          float(ee_t.cfg.curriculum_progress),
+          int(ee_t.cfg.stage),
+        )
+      )
+    return orig_reset(self, *args, **kwargs)
+
+  monkeypatch.setattr(ManagerBasedRlEnv, "reset", _spy_reset)
+
+  cfg2 = WbcTrainCfg(
+    task="Go2Piper-WBC-Flat",
+    num_envs=8,
+    buffer_len=32,
+    iterations=4,
+    warmup_iterations=0,
+    wm_window=4,
+    wm_batch=16,
+    wm_updates=1,
+    imag_batch=8,
+    horizon=4,
+    wm_hidden=(64, 64),
+    actor_hidden=(64, 32),
+    critic_hidden=(64, 32),
+    critic_epochs=1,
+    critic_minibatches=2,
+    target_curriculum_iterations=100,
+    wbc_stage=2,
+    resume=str(ckpt_path),
+    continue_run=True,
+    log_root=str(tmp_path),
+    run_name="p1_4_stage2",
+  )
+  t2 = WbcTrainer(cfg2)
+  try:
+    assert len(seen_at_first_reset) == 1
+    pre_step, pre_vel_p, pre_ee_p, pre_stage = seen_at_first_reset[0]
+    assert pre_step == saved_step
+    assert pre_vel_p == pytest.approx(saved_vel_p, rel=1e-5)
+    assert pre_ee_p == pytest.approx(saved_ee_p, rel=1e-5)
+    assert pre_stage == 2
+
+    assert int(t2.env.common_step_counter) == saved_step
+    vel_t2 = t2.env.command_manager.get_term("base_velocity")
+    ee_t2 = t2.env.command_manager.get_term("ee_pose")
+    assert float(vel_t2.cfg.curriculum_progress) == pytest.approx(saved_vel_p, rel=1e-5)
+    assert float(ee_t2.cfg.curriculum_progress) == pytest.approx(saved_ee_p, rel=1e-5)
+    assert ee_t2.cfg.stage == 2
+    assert ee_t2.cfg.trajectory_mode_prob == pytest.approx(0.40)
+  finally:
+    t2.close()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA GPU")
