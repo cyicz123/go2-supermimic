@@ -299,7 +299,8 @@ def test_soft_contact_world_fd_slide_and_heightfield() -> None:
   s0 = _make_standing_state(2, "cpu", base_z=0.30, feet_z_rel_ground=0.032)
   s1 = _make_standing_state(2, "cpu", base_z=0.30, feet_z_rel_ground=0.032)
 
-  p_c, z_foot, v_xy_w, _ = imag.soft_contact_and_foot_vel(s0, pose0, s1, pose1, 0.02)
+  p_c, z_foot, v_xy_w, _, p_c0 = imag.soft_contact_and_foot_vel(s0, pose0, s1, pose1, 0.02)
+  assert torch.allclose(p_c0, soft_contact_prob(z_foot, 0.032, 0.006), atol=1e-6)
   assert torch.allclose(p_c, soft_contact_prob(z_foot, 0.032, 0.006), atol=1e-6)
   assert torch.allclose(v_xy_w[0, :, 0], torch.full((4,), 5.0), atol=1e-4)
   assert torch.allclose(v_xy_w[1], torch.zeros(4, 2), atol=1e-5)

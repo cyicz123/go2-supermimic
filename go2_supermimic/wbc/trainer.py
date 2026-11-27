@@ -520,6 +520,10 @@ class WbcTrainer:
       "imagined_survival": float(data["surv"][:, -1].mean().item()),
       "actor_grad_norm": float(gnorm),
       "critic_loss": sum(c_losses) / max(1, len(c_losses)),
+      "imag_gait/f_implied_hz": float(data["imag_gait/f_implied_hz"].item()),
+      "imag_gait/p_moving_mean": float(data["imag_gait/p_moving_mean"].item()),
+      "imag_gait/p_mid_band_frac": float(data["imag_gait/p_mid_band_frac"].item()),
+      "imag_gait/feet_slide_raw": float(data["imag_gait/feet_slide_raw"].item()),
     }
 
   def save(self, it: int) -> Path:
@@ -595,15 +599,30 @@ class WbcTrainer:
           stats.update(self.improve_policy())
         if it % cfg.log_interval == 0:
           elapsed = time.time() - t_start
+          gait_print_keys = {
+            "imag_gait/f_implied_hz": "f_hz",
+            "imag_gait/p_moving_mean": "p_mov",
+            "imag_gait/p_mid_band_frac": "p_mid",
+            "imag_gait/feet_slide_raw": "slide_raw",
+          }
+          gait_line: list[str] = []
           for k_stat, v_stat in stats.items():
-            self.writer.add_scalar(f"train/{k_stat}", v_stat, it)
+            if k_stat in gait_print_keys:
+              self.writer.add_scalar(k_stat, v_stat, it)
+              gait_line.append(f"{gait_print_keys[k_stat]}={v_stat:.3g}")
+            else:
+              self.writer.add_scalar(f"train/{k_stat}", v_stat, it)
           line = [
             f"it {it}/{cfg.iterations}",
             f"{elapsed / 60:.1f} min",
             f"env_steps {self.env_steps / 1e6:.2f}M",
             f"step_cnt {int(self.env.common_step_counter)}",
           ]
-          line += [f"{k_stat} {v_stat:.4g}" for k_stat, v_stat in stats.items()]
+          line += [
+            f"{k_stat} {v_stat:.4g}"
+            for k_stat, v_stat in stats.items()
+            if k_stat not in gait_print_keys
+          ]
           line.append(f"archive {self.archive.size}")
           if self.nonfinite_steps:
             line.append(f"nonfinite_skipped {self.nonfinite_steps}")
@@ -621,6 +640,7 @@ class WbcTrainer:
             ):
               line.append(f"{k_ep.split('/')[-1]} {mean:.3g}")
           self.ep_stats.clear()
+          line.extend(gait_line)
           self.writer.add_scalar("time/minutes", elapsed / 60, it)
           print(" | ".join(line), flush=True)
           self._collapse_guard(falls_mean)

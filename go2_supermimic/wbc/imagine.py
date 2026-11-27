@@ -41,6 +41,7 @@ from go2_supermimic.wbc.state import (
   PIPER_COLLISION_LINK_GEOMS,
   QD,
   QD_ARM,
+  QD_LEG,
   Q,
   Q_ARM,
   Q_LEG,
@@ -279,17 +280,20 @@ class WbcRewardWeights:
   lin_vel_z_l2: float = -1.0
   ang_vel_xy_l2: float = -0.05
   # Differentiable gait
-  feet_slide_world_soft: float = -0.5
-  feet_clearance_soft: float = -10.0
+  feet_slide_world_soft: float = -1.0
+  feet_clearance_soft: float = -80.0
   standing_feet_air_soft: float = -1.0
   leg_joint_pos: float = -0.1
-  diagonal_trot_soft: float = -0.2
+  diagonal_trot_soft: float = -0.50
   joint_mirror: float = -0.05
+  contact_switch_tv: float = -0.55
+  contact_switch_l2: float = 0.0
   # Smoothness & safety
-  action_rate_leg_l2: float = -0.02
+  action_rate_leg_l2: float = -0.05
   action_rate_arm_l2: float = -0.02
-  joint_power: float = -2e-4
-  joint_torques_l2: float = -1e-5
+  leg_joint_acc_l2: float = -2.5e-7
+  joint_power: float = -5e-4
+  joint_torques_l2: float = -2.0e-5
   dof_pos_limits: float = -1.0
   arm_vel_hinge: float = -1.0
   self_collision_penetration: float = -20.0
@@ -309,7 +313,7 @@ class WbcImagineCfg:
   lin_vel_sigma: float = 0.5
   lin_vel_eps: float = 1e-3
   ang_vel_kernel: Literal["smooth_l1", "exp"] = "exp"
-  ang_vel_sigma: float = 0.5
+  ang_vel_sigma: float = 0.35
   ang_vel_eps: float = 1e-3
   ee_pos_sigma: float = 0.25
   ee_ori_delta: float = 0.5
@@ -446,19 +450,22 @@ class WbcImagination:
     *,
     ground_z0: torch.Tensor | None = None,
     ground_z1: torch.Tensor | None = None,
-  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute ``(p_contact, z_foot, v_foot_xy_w, v_foot_xy_norm)``."""
+  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute ``(p_contact, z_foot, v_foot_xy_w, v_foot_xy_norm, p_contact0)``."""
     gz0 = tr.ground(pose0[..., :2], self.field) if ground_z0 is None else ground_z0
     gz1 = tr.ground(pose1[..., :2], self.field) if ground_z1 is None else ground_z1
     p_foot_w0 = wbc_foot_positions_w(s0, pose0, ground_z=gz0)
     p_foot_w1 = wbc_foot_positions_w(s1, pose1, ground_z=gz1)
+    foot_ground_z0 = tr.ground(p_foot_w0[..., :2], self.field)
+    z_foot0 = p_foot_w0[..., 2] - foot_ground_z0
+    p_contact0 = soft_contact_prob(z_foot0, self.cfg.contact_height_m, self.cfg.contact_tau_m)
     foot_ground_z = tr.ground(p_foot_w1[..., :2], self.field)
     z_foot = p_foot_w1[..., 2] - foot_ground_z
     p_contact = soft_contact_prob(z_foot, self.cfg.contact_height_m, self.cfg.contact_tau_m)
     dt_t = dt.unsqueeze(-1).unsqueeze(-1) if torch.is_tensor(dt) else dt
     v_foot_xy_w = (p_foot_w1[..., :2] - p_foot_w0[..., :2]) / dt_t
     v_foot_xy_norm = safe_norm(v_foot_xy_w, eps=1e-6, dim=-1)
-    return p_contact, z_foot, v_foot_xy_w, v_foot_xy_norm
+    return p_contact, z_foot, v_foot_xy_w, v_foot_xy_norm, p_contact0
 
   def collision_penetration(self, fk: PiperFkResult) -> torch.Tensor:
     """Per-link tight Box-SDF penetration depths ``(..., 4)`` for ``link4..end_effector``."""
@@ -509,6 +516,44 @@ class WbcImagination:
     pens1: torch.Tensor | None = None,
   ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute differentiable per-step WBC rewards ``(total * dt, terms)``."""
+    total, terms, _ = self._compute_rewards_and_gait(
+      s0,
+      s1,
+      pose0,
+      pose1,
+      a,
+      a_prev,
+      q_ref_arm,
+      cmd_vel,
+      ee_pose_cmd,
+      xi,
+      k,
+      fk1=fk1,
+      ground_z0=ground_z0,
+      ground_z1=ground_z1,
+      pens1=pens1,
+    )
+    return total, terms
+
+  def _compute_rewards_and_gait(
+    self,
+    s0: torch.Tensor,
+    s1: torch.Tensor,
+    pose0: torch.Tensor,
+    pose1: torch.Tensor,
+    a: torch.Tensor,
+    a_prev: torch.Tensor,
+    q_ref_arm: torch.Tensor,
+    cmd_vel: torch.Tensor,
+    ee_pose_cmd: torch.Tensor,
+    xi: torch.Tensor,
+    k: dict,
+    *,
+    fk1: PiperFkResult | None = None,
+    ground_z0: torch.Tensor | None = None,
+    ground_z1: torch.Tensor | None = None,
+    pens1: torch.Tensor | None = None,
+  ) -> tuple[torch.Tensor, dict[str, torch.Tensor], torch.Tensor]:
     cfg, w = self.cfg, self.cfg.weights
     gz0 = tr.ground(pose0[..., :2], self.field) if ground_z0 is None else ground_z0
     gz1 = tr.ground(pose1[..., :2], self.field) if ground_z1 is None else ground_z1
@@ -556,7 +601,7 @@ class WbcImagination:
     ang_vel_xy_l2 = s1[..., W_B][..., :2].square().sum(dim=-1)
 
     # 3. Differentiable gait (world-frame FD foot velocity + B1 wz-gated moving mask)
-    p_contact, z_foot, _, v_foot_xy_norm = self.soft_contact_and_foot_vel(
+    p_contact, z_foot, _, v_foot_xy_norm, p_contact0 = self.soft_contact_and_foot_vel(
       s0, pose0, s1, pose1, cfg.dt, ground_z0=gz0, ground_z1=gz1
     )
     lin_cmd_norm = safe_norm(cmd_vel[..., :2], eps=1e-12, dim=-1)
@@ -564,6 +609,15 @@ class WbcImagination:
       (lin_cmd_norm > cfg.cmd_lin_thresh) | (cmd_vel[..., 2].abs() > cfg.cmd_ang_thresh)
     ).to(dtype=s1.dtype)
     standing_mask = 1.0 - moving_mask
+    lin_drive = F.relu(lin_cmd_norm - cfg.cmd_lin_thresh) / 0.25
+    ang_drive = F.relu(cmd_vel[..., 2].abs() - 0.08) / 0.42
+    moving_gate = moving_mask * (0.35 + 0.65 * torch.maximum(lin_drive, ang_drive)).clamp(0.0, 1.0)
+
+    dp_contact = p_contact - p_contact0
+    eps_tv = 0.01
+    contact_switch_tv_raw = (torch.sqrt(dp_contact.square() + eps_tv**2) - eps_tv).sum(dim=-1)
+    contact_switch_tv = contact_switch_tv_raw * moving_gate
+    contact_switch_l2 = dp_contact.square().sum(dim=-1) * moving_gate
 
     feet_slide_world_soft = (p_contact * v_foot_xy_norm).sum(dim=-1)
     feet_clearance_soft = (
@@ -597,6 +651,7 @@ class WbcImagination:
     da = a - a_prev
     action_rate_leg_l2 = da[..., :WBC_NUM_LEG_JOINTS].square().sum(dim=-1)
     action_rate_arm_l2 = da[..., WBC_NUM_LEG_JOINTS:].square().sum(dim=-1)
+    leg_joint_acc_l2 = ((s1[..., QD_LEG] - s0[..., QD_LEG]) / cfg.dt).square().sum(dim=-1)
 
     q = s1[..., Q] + k["default_q"]
     qd = s1[..., QD]
@@ -644,8 +699,11 @@ class WbcImagination:
       "leg_joint_pos": leg_joint_pos,
       "diagonal_trot_soft": diagonal_trot_soft,
       "joint_mirror": joint_mirror,
+      "contact_switch_tv": contact_switch_tv,
+      "contact_switch_l2": contact_switch_l2,
       "action_rate_leg_l2": action_rate_leg_l2,
       "action_rate_arm_l2": action_rate_arm_l2,
+      "leg_joint_acc_l2": leg_joint_acc_l2,
       "joint_power": joint_power,
       "joint_torques_l2": joint_torques_l2,
       "dof_pos_limits": dof_pos_limits,
@@ -653,7 +711,20 @@ class WbcImagination:
       "self_collision_penetration": self_collision_penetration,
     }
     total = sum(getattr(w, name) * val for name, val in terms.items())
-    return total * cfg.dt, terms
+    with torch.no_grad():
+      p_c_det = p_contact.detach()
+      p_mid = ((p_c_det > 0.25) & (p_c_det < 0.75)).to(dtype=p_c_det.dtype).mean(dim=-1)
+      gait_diag = torch.stack(
+        [
+          moving_mask.detach(),
+          contact_switch_tv_raw.detach(),
+          p_c_det.mean(dim=-1),
+          p_mid,
+          feet_slide_world_soft.detach(),
+        ],
+        dim=-1,
+      )
+    return total * cfg.dt, terms, gait_diag
 
   def _step(
     self,
@@ -706,7 +777,7 @@ class WbcImagination:
 
     fk_next = piper_fk(s_next[..., Q_ARM] + k["default_arm"])
     d, pens_next, _ = self.termination_prob(s_next, fk_next)
-    r, _ = self.compute_rewards(
+    r, _, gait_diag = self._compute_rewards_and_gait(
       s,
       s_next,
       pose,
@@ -747,6 +818,7 @@ class WbcImagination:
       r,
       d,
       crit_in,
+      gait_diag,
     )
 
   def rollout(
@@ -794,7 +866,7 @@ class WbcImagination:
       surv = torch.ones(B, device=self.device, dtype=s.dtype)
       ret = torch.zeros(B, device=self.device, dtype=s.dtype)
       disc = 1.0
-      rewards, survs, conts, crit_in = [], [], [], []
+      rewards, survs, conts, crit_in, gait_diags = [], [], [], [], []
       for _ in range(cfg.horizon):
         survs.append(surv)
         (
@@ -808,6 +880,7 @@ class WbcImagination:
           r,
           d,
           x,
+          gait_diag,
         ) = self._step_fn(
           s,
           pose,
@@ -825,6 +898,7 @@ class WbcImagination:
           wm,
         )
         crit_in.append(x)
+        gait_diags.append(gait_diag)
         ret = ret + disc * surv * r
         rewards.append(r)
         c_t = 1.0 - d
@@ -835,11 +909,27 @@ class WbcImagination:
       x_H = self.critic_input(s, pose, q_ref_arm, cmd_vel, ee_pose_cmd, xi, k)
       v_H = critic(x_H).squeeze(-1)
       objective = ret + disc * surv * v_H
+      with torch.no_grad():
+        gd = torch.stack(gait_diags, dim=1)
+        mov = (gd[..., 0] > 0.5).to(dtype=gd.dtype)
+        mov_count = mov.sum()
+        denom = mov_count.clamp_min(1.0)
+        has_mov = (mov_count > 0).to(dtype=gd.dtype)
+        hz_scale = 1.0 / (8.0 * 0.85 * cfg.dt)  # ~= 7.353 at dt=0.02
+        tv_moving_mean = (gd[..., 1] * mov).sum() / denom * has_mov
+        f_implied_hz = tv_moving_mean * hz_scale
+        p_moving_mean = (gd[..., 2] * mov).sum() / denom * has_mov
+        p_mid_band_frac = (gd[..., 3] * mov).sum() / denom * has_mov
+        feet_slide_raw = (gd[..., 4] * mov).sum() / denom * has_mov
       return objective, {
         "rewards": torch.stack(rewards, dim=1),
         "cont": torch.stack(conts, dim=1),
         "surv": torch.stack(survs + [surv], dim=1),
         "critic_in": torch.stack(crit_in + [x_H], dim=1),
+        "imag_gait/f_implied_hz": f_implied_hz,
+        "imag_gait/p_moving_mean": p_moving_mean,
+        "imag_gait/p_mid_band_frac": p_mid_band_frac,
+        "imag_gait/feet_slide_raw": feet_slide_raw,
       }
     finally:
       for p, req in zip(wm_params, wm_req, strict=True):
