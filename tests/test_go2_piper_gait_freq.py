@@ -5,11 +5,20 @@ from __future__ import annotations
 import math
 from pathlib import Path
 
+import mujoco
 import pytest
 import torch
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 from torch import nn
 
+from mjlab.entity import Entity
+
+from go2_supermimic.robot.go2_piper import (
+  ARM_JOINT_NAMES,
+  LEG_JOINT_NAMES,
+  get_go2_piper_robot_cfg,
+  get_spec,
+)
 from go2_supermimic.supermimic.train import Actor, Critic
 from go2_supermimic.supermimic.world_model import WorldModel
 from go2_supermimic.target import terrain as tr
@@ -163,22 +172,39 @@ def _make_rollout_seed(
   }
 
 
-def test_config_m2_defaults() -> None:
+def test_route2b_defaults() -> None:
   cfg = WbcImagineCfg()
   w = WbcRewardWeights()
   assert cfg.ang_vel_sigma == pytest.approx(0.35)
+  assert cfg.contact_height_m == pytest.approx(0.0255)
+  assert cfg.contact_tau_m == pytest.approx(0.0030)
+  assert cfg.foot_clearance_target == pytest.approx(0.065)
+  assert cfg.gait_eps_energy == pytest.approx(4.0e-5)
+  assert cfg.gait_sub_band_weight == pytest.approx(1.15)
+  assert cfg.gait_high_band_weight == pytest.approx(0.55)
+  assert cfg.gait_peak_beta == pytest.approx(180.0)
+  assert cfg.gait_peak_lme_target_m == pytest.approx(0.056)
   assert cfg.weights == w
 
-  assert w.contact_switch_tv == pytest.approx(-0.30)
+  assert w.contact_switch_tv == pytest.approx(0.0)
   assert w.contact_switch_l2 == pytest.approx(0.0)
-  assert w.leg_joint_acc_l2 == pytest.approx(-3.0e-7)
+  assert w.gait_bandpass == pytest.approx(1.20)
+  assert w.gait_peak_lse == pytest.approx(-220.0)
+  assert w.gait_diag_corr == pytest.approx(0.45)
+  assert w.leg_joint_acc_l2 == pytest.approx(-2.5e-7)
   assert w.action_rate_leg_l2 == pytest.approx(-0.03)
   assert w.action_rate_arm_l2 == pytest.approx(-0.02)
   assert w.joint_power == pytest.approx(-2.0e-4)
   assert w.joint_torques_l2 == pytest.approx(-2.0e-5)
-  assert w.feet_clearance_soft == pytest.approx(-40.0)
-  assert w.feet_slide_world_soft == pytest.approx(-0.5)
-  assert w.diagonal_trot_soft == pytest.approx(-0.30)
+  assert w.feet_clearance_soft == pytest.approx(-25.0)
+  assert w.feet_slide_world_soft == pytest.approx(-0.80)
+  assert w.diagonal_trot_soft == pytest.approx(-0.25)
+
+  mj_model = Entity(get_go2_piper_robot_cfg()).spec.compile()
+  for jname in ARM_JOINT_NAMES:
+    dof_adr = int(mj_model.joint(jname).dofadr[0])
+    assert mj_model.dof_damping[dof_adr] == pytest.approx(0.05, abs=1e-6)
+    assert mj_model.dof_armature[dof_adr] == pytest.approx(0.01, abs=1e-6)
 
   # Unchanged task, stability, and safety weights
   assert w.track_lin_vel_xy == pytest.approx(3.0)
@@ -272,7 +298,7 @@ def test_moving_gate_regimes() -> None:
   k = imag.rollout_constants(torch.arange(B))
 
   _, terms = imag.compute_rewards(s0, s1, pose0, pose1, a, a_prev, q_ref_arm, cmd_vel, ee_cmd, xi, k)
-  _, terms_diag, gait_diag = imag._compute_rewards_and_gait(
+  _, terms_diag, gait_diag, _ = imag._compute_rewards_and_gait(
     s0, s1, pose0, pose1, a, a_prev, q_ref_arm, cmd_vel, ee_cmd, xi, k
   )
 
@@ -306,7 +332,11 @@ def test_moving_gate_regimes() -> None:
 
 def test_contact_switch_monotonic_in_freq_stationary_zero_and_grads() -> None:
   consts = _synthetic_consts(2, "cpu")
-  imag = WbcImagination(WbcImagineCfg(dt=0.02), consts, "cpu")
+  imag = WbcImagination(
+    WbcImagineCfg(dt=0.02, weights=WbcRewardWeights(contact_switch_tv=-0.30)),
+    consts,
+    "cpu",
+  )
   k = imag.rollout_constants(torch.arange(2))
   pose0 = torch.zeros(2, 3)
   pose1 = torch.zeros(2, 3)
@@ -512,10 +542,10 @@ def test_config_m_32step_bptt_and_imag_gait_diagnostics() -> None:
 
   # Independently compute expected metrics over row 1 only
   z_prev = torch.full((4,), 0.0205)
-  p_prev = soft_contact_prob(z_prev, 0.032, 0.006)
+  p_prev = soft_contact_prob(z_prev, imag_s.cfg.contact_height_m, imag_s.cfg.contact_tau_m)
   tv_list, p_mean_list, p_mid_list, slide_list = [], [], [], []
   for z_t in z_seq:
-    p_t = soft_contact_prob(z_t, 0.032, 0.006)
+    p_t = soft_contact_prob(z_t, imag_s.cfg.contact_height_m, imag_s.cfg.contact_tau_m)
     dp = p_t - p_prev
     tv_list.append((torch.sqrt(dp.square() + 0.01**2) - 0.01).sum().item())
     p_mean_list.append(p_t.mean().item())
@@ -614,3 +644,307 @@ def test_trainer_tb_gait_scalars_and_export_contract(
   with torch.no_grad():
     err = float((loaded(obs) - actor(obs)).abs().max().item())
   assert err < 1e-6
+
+
+# ---------------------------------------------------------------------------
+# Route 2B Dedicated Verification Suite (6 Tests)
+# ---------------------------------------------------------------------------
+
+
+def test_go2_piper_xml_arm_passive_damping_and_armature() -> None:
+  entity_model = Entity(get_go2_piper_robot_cfg()).spec.compile()
+  bare_model = get_spec().compile()
+  for model in (entity_model, bare_model):
+    for jname in ARM_JOINT_NAMES:
+      dof_adr = int(model.joint(jname).dofadr[0])
+      assert model.dof_damping[dof_adr] == pytest.approx(0.05, abs=1e-6)
+      assert model.dof_armature[dof_adr] == pytest.approx(0.01, abs=1e-6)
+    for jname in LEG_JOINT_NAMES:
+      dof_adr = int(model.joint(jname).dofadr[0])
+      assert model.dof_damping[dof_adr] == pytest.approx(0.10, abs=1e-6)
+
+
+def test_route2b_bandpass_peaks_at_2p5hz_and_rejects_6hz_sub1hz_and_micro_tremor() -> None:
+  H = 32
+  dt = 0.02
+  n_phases = 64
+  consts = _synthetic_consts(n_phases, "cpu")
+  imag = WbcImagination(WbcImagineCfg(horizon=H, dt=dt, obs_noise=False), consts, "cpu")
+
+  phases = torch.linspace(0.0, 2.0 * math.pi, n_phases + 1)[:-1].view(n_phases, 1, 1)
+  t = (torch.arange(1, H + 1, dtype=torch.float32) * dt).view(1, H, 1)
+  trot_off = torch.tensor([0.0, math.pi, math.pi, 0.0]).view(1, 1, 4)
+
+  cmd_move = torch.tensor([[0.40, 0.0, 0.0]]).expand(n_phases, 3)
+  v_xy_ok = torch.tensor([[[0.38, 0.0]]]).expand(n_phases, H, 2)
+  wz_ok = torch.zeros(n_phases, H)
+
+  def eval_bandpass(z_seq: torch.Tensor, cmd: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    return imag.compute_window_gait_rewards(z_seq, v_xy_ok, wz_ok, cmd)
+
+  z_2p5 = 0.0205 + 0.0545 * torch.relu(torch.sin(2.0 * math.pi * 2.5 * t + phases + trot_off))
+  z_0p8 = 0.0205 + 0.0495 * torch.relu(torch.sin(2.0 * math.pi * 0.8 * t + phases + trot_off))
+  z_6p0 = 0.0205 + 0.0345 * torch.relu(torch.sin(2.0 * math.pi * 6.0 * t + phases + trot_off))
+  z_freeze = torch.full((n_phases, H, 4), 0.0205)
+  z_tremor = 0.0205 + 0.0005 * torch.sin(2.0 * math.pi * 2.5 * t + phases + trot_off)
+
+  t0s = torch.linspace(0.08, 0.52, n_phases).view(n_phases, 1, 1)
+  z_1lift = torch.full((n_phases, H, 4), 0.0205)
+  z_1lift[:, :, [0, 3]] = 0.0205 + 0.0545 * torch.sigmoid((t - t0s) / 0.03)
+
+  r_2p5, d_2p5 = eval_bandpass(z_2p5, cmd_move)
+  r_0p8, d_0p8 = eval_bandpass(z_0p8, cmd_move)
+  r_1lift, d_1lift = eval_bandpass(z_1lift, cmd_move)
+  r_6p0, d_6p0 = eval_bandpass(z_6p0, cmd_move)
+  r_freeze, d_freeze = eval_bandpass(z_freeze, cmd_move)
+  r_tremor, d_tremor = eval_bandpass(z_tremor, cmd_move)
+
+  assert d_2p5["gait_bandpass"].min().item() > 0.20
+  assert d_2p5["gait_bandpass"].mean().item() > d_0p8["gait_bandpass"].mean().item() + 0.40
+  assert d_2p5["gait_bandpass"].mean().item() > d_1lift["gait_bandpass"].mean().item() + 0.35
+  assert d_2p5["gait_bandpass"].mean().item() > d_6p0["gait_bandpass"].mean().item() + 0.55
+  assert d_2p5["gait_bandpass"].mean().item() > d_freeze["gait_bandpass"].mean().item() + 0.20
+  assert d_2p5["gait_bandpass"].mean().item() > d_tremor["gait_bandpass"].mean().item() + 0.20
+  assert r_2p5.mean().item() > max(
+    r_0p8.mean().item(),
+    r_1lift.mean().item(),
+    r_6p0.mean().item(),
+    r_freeze.mean().item(),
+    r_tremor.mean().item(),
+  )
+  assert d_tremor["rho_pass"].max().item() < 0.005
+
+  # Pure standing command must zero all Route 2B window terms
+  r_stand, d_stand = eval_bandpass(z_2p5, torch.zeros(n_phases, 3))
+  assert torch.all(d_stand["gait_bandpass"] == 0.0)
+  assert torch.all(r_stand == 0.0)
+
+
+def test_route2b_peak_lse_debiased_zero_above_target_and_penalizes_skim() -> None:
+  H = 32
+  dt = 0.02
+  consts = _synthetic_consts(2, "cpu")
+  imag = WbcImagination(WbcImagineCfg(horizon=H, dt=dt, obs_noise=False), consts, "cpu")
+  cmd = torch.tensor([[0.40, 0.0, 0.0], [0.40, 0.0, 0.0]])
+  t = (torch.arange(1, H + 1, dtype=torch.float32) * dt).view(1, H, 1)
+  off = torch.tensor([0.0, math.pi, math.pi, 0.0]).view(1, 1, 4)
+
+  # Constant 0.0205 m -> exact 0.0205 m (zero positive LogSumExp bias)
+  z_const = torch.full((2, H, 4), 0.0205)
+  _, d_const = imag.compute_window_gait_rewards(z_const, None, None, cmd)
+  assert torch.allclose(d_const["z_peak_lme"], torch.full((2,), 0.0205), atol=1e-6)
+
+  # 7.5 cm swing -> penalty & gradient strictly 0.0
+  z_high = (0.0205 + 0.0545 * torch.relu(torch.sin(2.0 * math.pi * 2.5 * t + off))).expand(2, H, 4).clone().requires_grad_(True)
+  _, d_high = imag.compute_window_gait_rewards(z_high, None, None, cmd)
+  assert torch.all(d_high["gait_peak_lse"] == 0.0)
+  d_high["gait_peak_lse"].sum().backward()
+  assert z_high.grad is not None and torch.all(z_high.grad == 0.0)
+
+  # 3.0 cm skim -> positive penalty & upward gradient on peak samples
+  z_skim = (0.0205 + 0.0095 * torch.relu(torch.sin(2.0 * math.pi * 6.0 * t + off))).expand(2, H, 4).clone().requires_grad_(True)
+  _, d_skim = imag.compute_window_gait_rewards(z_skim, None, None, cmd)
+  assert torch.all(d_skim["gait_peak_lse"] > 0.0)
+  (imag.cfg.weights.gait_peak_lse * d_skim["gait_peak_lse"]).sum().backward()
+  assert z_skim.grad is not None and torch.isfinite(z_skim.grad).all()
+  assert z_skim.grad.max().item() > 0.0
+
+
+def test_route2b_d4_diag_corr_trot_positive_pace_bound_pronk_negative() -> None:
+  H = 32
+  dt = 0.02
+  consts = _synthetic_consts(1, "cpu")
+  imag = WbcImagination(WbcImagineCfg(horizon=H, dt=dt, obs_noise=False), consts, "cpu")
+  cmd = torch.tensor([[0.40, 0.0, 0.0]])
+  t = (torch.arange(1, H + 1, dtype=torch.float32) * dt).view(1, H, 1)
+
+  def mk_wave(off_list: list[float], active: list[float] | None = None) -> torch.Tensor:
+    off = torch.tensor(off_list).view(1, 1, 4)
+    act = torch.tensor(active if active is not None else [1.0, 1.0, 1.0, 1.0]).view(1, 1, 4)
+    return 0.0205 + 0.0545 * torch.relu(torch.sin(2.0 * math.pi * 2.5 * t + off)) * act
+
+  z_trot = mk_wave([0.0, math.pi, math.pi, 0.0])
+  z_pace = mk_wave([0.0, math.pi, 0.0, math.pi])
+  z_bound = mk_wave([0.0, 0.0, math.pi, math.pi])
+  z_pronk = mk_wave([0.0, 0.0, 0.0, 0.0])
+  z_freeze = torch.full((1, H, 4), 0.0205)
+  z_limp = mk_wave([0.0, math.pi, math.pi, 0.0], active=[1.0, 0.0, 0.0, 1.0])
+
+  _, d_trot = imag.compute_window_gait_rewards(z_trot, None, None, cmd)
+  _, d_pace = imag.compute_window_gait_rewards(z_pace, None, None, cmd)
+  _, d_bound = imag.compute_window_gait_rewards(z_bound, None, None, cmd)
+  _, d_pronk = imag.compute_window_gait_rewards(z_pronk, None, None, cmd)
+  _, d_freeze = imag.compute_window_gait_rewards(z_freeze, None, None, cmd)
+  _, d_limp = imag.compute_window_gait_rewards(z_limp, None, None, cmd)
+
+  trot_val = d_trot["diag_corr_raw"].item()
+  assert trot_val > 0.65
+  assert d_pace["diag_corr_raw"].item() < -0.25
+  assert d_bound["diag_corr_raw"].item() < -0.25
+  assert d_pronk["diag_corr_raw"].item() < -0.25
+  assert d_freeze["diag_corr_raw"].item() == pytest.approx(0.0, abs=1e-10)
+  assert d_limp["diag_corr_raw"].item() < 0.25 * trot_val
+
+
+def test_route2b_critic_bellman_consistency_and_post_fall_zero_grad() -> None:
+  torch.manual_seed(7)
+  H = 32
+  dt = 0.02
+  B = 4
+  consts = _synthetic_consts(B, "cpu")
+  imag = WbcImagination(
+    WbcImagineCfg(horizon=H, gamma=0.99, lam=1.0, dt=dt, obs_noise=False),
+    consts,
+    "cpu",
+  )
+  actor = Actor(WBC_ACTOR_OBS_DIM, (64, 32), WBC_NUM_JOINTS)
+
+  class _ConstCritic(nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+      return torch.full((*x.shape[:-1], 1), 3.25, device=x.device, dtype=x.dtype)
+
+  class _TiltedWM(nn.Module):
+    def __init__(self) -> None:
+      super().__init__()
+      self.step_idx = 0
+
+    def forward(self, s, a, a_prev, xi, relief=None, q_ref_arm=None):
+      del a, a_prev, xi, relief, q_ref_arm
+      self.step_idx += 1
+      s_next = s.clone()
+      t_val = self.step_idx * dt
+      off = torch.tensor([0.0, math.pi, math.pi, 0.0], device=s.device, dtype=s.dtype)
+      z_next = 0.0205 + 0.0545 * torch.relu(torch.sin(2.0 * math.pi * 2.5 * t_val + off))
+      feet = s_next[:, wbc_st.FEET].reshape(s.shape[0], 4, 3)
+      feet[:, :, 2] = z_next.unsqueeze(0) - s_next[:, 0:1]
+      s_next[:, wbc_st.FEET] = feet.reshape(s.shape[0], 12)
+      s_next[:, wbc_st.V_YAW][:, 0] = 0.40
+      # Induce partial soft termination at step 12 on env 1
+      if self.step_idx == 12:
+        s_next[1, wbc_st.GRAV] = torch.tensor([0.9, 0.0, -0.435], device=s.device)
+      dpose = torch.zeros(s.shape[0], 3, device=s.device, dtype=s.dtype)
+      dpose[:, 0] = 0.40 * dt
+      return s_next, dpose
+
+  critic = _ConstCritic()
+  seed = _make_rollout_seed(B, "cpu", consts)
+  objective, data = imag.rollout(_TiltedWM(), actor, critic, seed)
+  targets = imag.gae_targets(critic, data)
+  assert (targets[:, 0] - objective.detach()).abs().max().item() < 1e-5
+
+  # Post-fall zero-gradient isolation audit: d_t = 1.0 from t=10 onward -> surv_after[:, 10:] = 0.0
+  t = (torch.arange(1, H + 1, dtype=torch.float32) * dt).view(1, H, 1)
+  off = torch.tensor([0.0, math.pi, math.pi, 0.0]).view(1, 1, 4)
+  z_fall = (0.0205 + 0.0545 * torch.relu(torch.sin(2.0 * math.pi * 2.5 * t + off))).expand(2, H, 4).clone()
+  z_fall[:, 10:, :] = 2.50
+  z_fall.requires_grad_(True)
+  surv_after = torch.ones((2, H), dtype=torch.float32)
+  surv_after[:, 10:] = 0.0
+  r_fall, _ = imag.compute_window_gait_rewards(
+    z_fall, None, None, torch.tensor([[0.40, 0.0, 0.0], [0.40, 0.0, 0.0]]), surv_after
+  )
+  r_fall.sum().backward()
+  assert z_fall.grad is not None and torch.isfinite(z_fall.grad).all()
+  assert z_fall.grad[:, :10, :].abs().max().item() > 0.0
+  assert torch.all(z_fall.grad[:, 10:, :] == 0.0)
+
+
+def test_route2b_multi_horizon_32step_bptt_and_tb_8_gait_scalars(
+  tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+  torch.manual_seed(11)
+  device = "cuda:0" if torch.cuda.is_available() else "cpu"
+  for H in (4, 8, 20, 32):
+    B = 4
+    consts = _synthetic_consts(B, device)
+    wm = WorldModel(
+      hidden=(64, 64),
+      state_dim=WBC_STATE_DIM,
+      act_dim=WBC_NUM_JOINTS,
+      context_dim=WBC_CONTEXT_DIM,
+      scan_dim=0,
+      q_ref_arm_dim=WBC_Q_REF_ARM_DIM,
+      pose_delta_dim=WBC_POSE_DELTA_DIM,
+      z_slice=wbc_st.Z,
+      state_slices=WBC_STATE_LAYOUT,
+    ).to(device)
+    imag = WbcImagination(WbcImagineCfg(horizon=H, obs_noise=False), consts, device)
+    actor = Actor(WBC_ACTOR_OBS_DIM, (128, 64), WBC_NUM_JOINTS).to(device)
+    critic = Critic(imag.critic_dim, (128, 64)).to(device)
+    seed = _make_rollout_seed(B, device, consts)
+    objective, data = imag.rollout(wm, actor, critic, seed)
+    assert torch.isfinite(objective).all()
+    for gkey in (
+      "imag_gait/f_implied_hz",
+      "imag_gait/p_moving_mean",
+      "imag_gait/p_mid_band_frac",
+      "imag_gait/feet_slide_raw",
+      "imag_gait/f_peak_hz",
+      "imag_gait/z_peak_lme_cm",
+      "imag_gait/diag_corr",
+      "imag_gait/rho_pass",
+    ):
+      assert data[gkey].ndim == 0
+      assert not data[gkey].requires_grad
+      assert torch.isfinite(data[gkey])
+
+    actor.zero_grad(set_to_none=True)
+    (-objective.mean()).backward()
+    for name, p in actor.named_parameters():
+      assert p.grad is not None, f"H={H} missing grad for {name}"
+      assert torch.isfinite(p.grad).all()
+      assert p.grad.abs().sum().item() > 0.0
+
+  # 210D -> 18D TorchScript parity < 1e-6
+  actor_cpu = Actor(WBC_ACTOR_OBS_DIM, (128, 64), WBC_NUM_JOINTS).eval()
+  ts_path = tmp_path / "route2b_actor_ts.pt"
+  export_wbc_actor_torchscript(actor_cpu, ts_path, verify=True, atol=1e-6)
+  loaded = torch.jit.load(str(ts_path), map_location="cpu").eval()
+  obs_probe = torch.randn(4, WBC_ACTOR_OBS_DIM)
+  with torch.no_grad():
+    assert float((loaded(obs_probe) - actor_cpu(obs_probe)).abs().max().item()) < 1e-6
+
+  if torch.cuda.is_available():
+    cfg = WbcTrainCfg(
+      task="Go2Piper-WBC-Flat",
+      num_envs=8,
+      buffer_len=32,
+      iterations=2,
+      warmup_iterations=0,
+      wm_window=4,
+      wm_batch=16,
+      wm_updates=1,
+      imag_batch=8,
+      horizon=32,
+      wm_hidden=(64, 64),
+      actor_hidden=(64, 32),
+      critic_hidden=(64, 32),
+      critic_epochs=1,
+      critic_minibatches=2,
+      log_interval=2,
+      save_interval=100,
+      log_root=str(tmp_path),
+      run_name="route2b_tb8_smoke",
+    )
+    trainer = WbcTrainer(cfg)
+    trainer.run()
+    captured = capsys.readouterr().out
+    for tok in ("f_hz=", "p_mov=", "p_mid=", "slide_raw=", "f_pk=", "z_lme=", "d_corr=", "r_pass="):
+      assert tok in captured, f"Missing console token {tok}"
+    ea = EventAccumulator(str(trainer.log_dir))
+    ea.Reload()
+    tags = set(ea.Tags()["scalars"])
+    for expected_tag in (
+      "imag_gait/f_implied_hz",
+      "imag_gait/p_moving_mean",
+      "imag_gait/p_mid_band_frac",
+      "imag_gait/feet_slide_raw",
+      "imag_gait/f_peak_hz",
+      "imag_gait/z_peak_lme_cm",
+      "imag_gait/diag_corr",
+      "imag_gait/rho_pass",
+    ):
+      assert expected_tag in tags, f"Missing TB tag {expected_tag}; got {sorted(tags)}"
+      events = ea.Scalars(expected_tag)
+      assert [e.step for e in events] == [2]
+      assert math.isfinite(events[0].value)
