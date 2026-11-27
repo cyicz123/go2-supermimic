@@ -1,4 +1,4 @@
-﻿"""Whole-body control (WBC) components for Go2+Piper."""
+"""Whole-body control (WBC) components for Go2+Piper."""
 
 from go2_supermimic.wbc.actions import (
   PiperSlewJointPositionAction,
@@ -23,6 +23,23 @@ from go2_supermimic.wbc.env_cfg import (
   go2_piper_wbc_env_cfg,
   wbc_command_curriculum,
   wbc_previous_action,
+)
+from go2_supermimic.wbc.export import (
+  WbcExportActor,
+  export_wbc_actor_torchscript,
+  verify_wbc_torchscript_parity,
+)
+from go2_supermimic.wbc.imagine import (
+  WBC_CRITIC_BASE_DIM,
+  WBC_STATE_LAYOUT,
+  WbcImagineCfg,
+  WbcImagination,
+  WbcRewardWeights,
+  box_sdf_penetration,
+  piper_body_aabbs_link0,
+  piper_tight_collision_radii,
+  quat_geodesic_angle,
+  soft_contact_prob,
 )
 from go2_supermimic.wbc.state import (
   PIPER_COLLISION_LINK_GEOMS,
@@ -69,6 +86,7 @@ __all__ = [
   "WBC_ACTOR_HISTORY",
   "WBC_ACTOR_OBS_DIM",
   "WBC_CONTEXT_DIM",
+  "WBC_CRITIC_BASE_DIM",
   "WBC_NUM_ARM_JOINTS",
   "WBC_NUM_JOINTS",
   "WBC_NUM_LEG_JOINTS",
@@ -77,21 +95,33 @@ __all__ = [
   "WBC_POSE_DELTA_DIM",
   "WBC_Q_REF_ARM_DIM",
   "WBC_STATE_DIM",
+  "WBC_STATE_LAYOUT",
   "WbcContextReader",
   "WbcEePoseCommand",
   "WbcEePoseCommandCfg",
+  "WbcExportActor",
+  "WbcImagineCfg",
+  "WbcImagination",
+  "WbcRewardWeights",
   "WbcRobotConsts",
   "WbcVelocityCommand",
   "WbcVelocityCommandCfg",
   "advance_ee_traj_state",
+  "box_sdf_penetration",
   "ee_world_height",
+  "export_wbc_actor_torchscript",
   "go2_piper_wbc_env_cfg",
   "pack_ee_traj_state",
+  "piper_body_aabbs_link0",
   "piper_collision_radii",
   "piper_fk",
+  "piper_tight_collision_radii",
+  "quat_geodesic_angle",
   "slew_step_arm",
   "slew_step_arm_diff",
+  "soft_contact_prob",
   "unpack_ee_traj_state",
+  "verify_wbc_torchscript_parity",
   "wbc_apply_pose_delta",
   "wbc_command_curriculum",
   "wbc_feet_world_z",
