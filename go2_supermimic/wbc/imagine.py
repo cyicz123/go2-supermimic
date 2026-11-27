@@ -306,11 +306,11 @@ class WbcRewardWeights:
   # Task tracking
   track_lin_vel_xy: float = 3.0
   track_ang_vel_z: float = 1.0
-  ee_pos_exp: float = 3.0
+  ee_pos_exp: float = 4.5
   ee_ori_huber: float = -1.5
   # Base stability
   track_base_height_exp: float = 1.0
-  flat_orientation_l2: float = -2.0
+  flat_orientation_l2: float = -0.4
   lin_vel_z_l2: float = -1.0
   ang_vel_xy_l2: float = -0.05
   # Differentiable gait
@@ -696,7 +696,7 @@ class WbcImagination:
     standing_feet_air_soft = (1.0 - p_contact).sum(dim=-1) * standing_mask
 
     q_rel_leg = s1[..., Q_LEG]
-    leg_joint_pos = (1.0 + 4.0 * standing_mask) * q_rel_leg.square().sum(dim=-1)
+    leg_joint_pos = q_rel_leg.square().sum(dim=-1)
 
     p0, p1, p2, p3 = p_contact.unbind(dim=-1)
     diagonal_trot_soft = (

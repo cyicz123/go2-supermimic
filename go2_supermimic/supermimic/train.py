@@ -131,6 +131,18 @@ class TrainCfg:
   run_name: str = "supermimic"
   log_root: str = "logs/supermimic"
   wbc_stage: int = 1
+  initial_curriculum_progress: float = 0.0
+  """Initial curriculum progress in [0, 1] when starting/warm-starting without --continue-run."""
+  ee_adaptive_sampling: bool = True
+  """Enable 2D error-weighted adaptive sampling for WBC ee_pose commands."""
+  ee_adaptive_uniform_prob: float = 0.3
+  """Uniform exploration floor epsilon in [0, 1] for adaptive ee_pose sampling (1.0 = pure uniform)."""
+  ee_max_xy_radius: float | None = 0.69
+  """Analytic XY radius cap [m] in link0 frame for ee_pose command sampling."""
+  wbc_flat_orientation_l2: float | None = None
+  """Optional override for WbcRewardWeights.flat_orientation_l2."""
+  wbc_ee_pos_exp: float | None = None
+  """Optional override for WbcRewardWeights.ee_pos_exp."""
 
 
 class Actor(nn.Module):
@@ -654,13 +666,23 @@ def main() -> None:
     defaults = TrainCfg()
     cfg_cls = TrainCfg
 
+  def _opt_float(x: str) -> float | None:
+    return None if x.lower() in ("none", "null") else float(x)
+
   ap = argparse.ArgumentParser()
   for name, val in asdict(defaults).items():
     if isinstance(val, tuple):
       ap.add_argument(f"--{name.replace('_', '-')}", type=int, nargs="+", default=list(val))
     elif isinstance(val, bool):  # type=bool would read "false" as True
-      ap.add_argument(f"--{name.replace('_', '-')}", type=lambda x: x.lower() in ("1", "true"),
-                      default=val)
+      ap.add_argument(
+        f"--{name.replace('_', '-')}",
+        nargs="?",
+        const="true",
+        type=lambda x: x.lower() in ("1", "true", "yes"),
+        default=val,
+      )
+    elif val is None or name == "ee_max_xy_radius":
+      ap.add_argument(f"--{name.replace('_', '-')}", type=_opt_float, default=val)
     else:
       ap.add_argument(f"--{name.replace('_', '-')}", type=type(val), default=val)
   args = vars(ap.parse_args())

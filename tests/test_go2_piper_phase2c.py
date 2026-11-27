@@ -343,7 +343,7 @@ def test_gait_wz_gating_standing_5x_and_reward_terms() -> None:
   assert terms["standing_feet_air_soft"][2].item() == pytest.approx(0.0, abs=1e-7)
 
   assert terms["leg_joint_pos"][0].item() / terms["leg_joint_pos"][1].item() == pytest.approx(
-    5.0, rel=1e-5
+    1.0, rel=1e-5
   )
 
   assert terms["arm_vel_hinge"][0].item() == pytest.approx(0.0, abs=1e-7)

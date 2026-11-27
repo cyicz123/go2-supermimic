@@ -547,7 +547,91 @@ class WbcEePoseCommand(CommandTerm):
     self._pending_step_dt: float | torch.Tensor | None = None
     self.metrics["position_error"] = torch.zeros(self.num_envs, device=self.device)
     self.metrics["orientation_error"] = torch.zeros(self.num_envs, device=self.device)
+    n_bins = int(cfg.adaptive_x_bins) * int(cfg.adaptive_z_bins)
+    self._eval_env_mask = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+    self._bin_id = torch.full((self.num_envs,), -1, dtype=torch.long, device=self.device)
+    self._cmd_age = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+    self._bin_err = torch.full(
+      (n_bins,), float(cfg.adaptive_init_err), dtype=torch.float32, device=self.device
+    )
+    self._bin_counts = torch.zeros(n_bins, dtype=torch.long, device=self.device)
     self.set_curriculum_progress(cfg.curriculum_progress)
+
+  def set_eval_env_mask(self, mask: torch.Tensor | None) -> None:
+    """Restrict adaptive bin error updates to non-exploration environments."""
+    if mask is None:
+      self._eval_env_mask.fill_(True)
+      return
+    mask_t = mask.to(device=self.device, dtype=torch.bool).reshape(-1)
+    if mask_t.shape[0] != self.num_envs:
+      raise ValueError(
+        f"Expected eval env mask of length {self.num_envs}, got {mask_t.shape[0]}"
+      )
+    self._eval_env_mask.copy_(mask_t)
+
+  def bin_probabilities(self) -> torch.Tensor:
+    """Compute normalized 2D (x, z) bin sampling probabilities with uniform floor."""
+    n_bins = int(self.cfg.adaptive_x_bins) * int(self.cfg.adaptive_z_bins)
+    eps = float(self.cfg.adaptive_uniform_prob)
+    if (not self.cfg.adaptive_sampling) or eps >= 1.0:
+      return torch.full((n_bins,), 1.0 / float(n_bins), device=self.device, dtype=torch.float32)
+    e_min = float(self.cfg.adaptive_err_clip[0])
+    e_max = float(self.cfg.adaptive_err_clip[1])
+    beta = float(self.cfg.adaptive_beta)
+    weights = self._bin_err.clamp(min=e_min, max=e_max).pow(beta)
+    w_sum = weights.sum().clamp(min=1e-12)
+    return (1.0 - eps) * (weights / w_sum) + eps / float(n_bins)
+
+  def adaptive_metrics(self) -> dict[str, float]:
+    """Read-only summary metrics for TensorBoard and console logging."""
+    n_x = int(self.cfg.adaptive_x_bins)
+    n_z = int(self.cfg.adaptive_z_bins)
+    probs_2d = self.bin_probabilities().view(n_x, n_z)
+    err_2d = self._bin_err.view(n_x, n_z)
+    return {
+      "prob_low_z": float(probs_2d[:, 0].sum().item()),
+      "prob_high_z": float(probs_2d[:, -1].sum().item()),
+      "prob_max": float(probs_2d.max().item()),
+      "err_low_z": float(err_2d[:, 0].mean().item()),
+      "err_high_z": float(err_2d[:, -1].mean().item()),
+    }
+
+  def adaptive_state_dict(self) -> dict[str, torch.Tensor | int]:
+    """Return adaptive sampling state for checkpoint persistence."""
+    return {
+      "x_bins": int(self.cfg.adaptive_x_bins),
+      "z_bins": int(self.cfg.adaptive_z_bins),
+      "bin_err": self._bin_err.detach().cpu().clone(),
+      "bin_counts": self._bin_counts.detach().cpu().clone(),
+    }
+
+  def load_adaptive_state_dict(self, state: dict | None) -> None:
+    """Restore adaptive sampling state when bin shape matches; ignore incompatible/missing."""
+    if not isinstance(state, dict):
+      return
+    bin_err = state.get("bin_err")
+    if not torch.is_tensor(bin_err) or bin_err.shape != self._bin_err.shape:
+      return
+    self._bin_err.copy_(bin_err.to(device=self.device, dtype=self._bin_err.dtype))
+    bin_counts = state.get("bin_counts")
+    if torch.is_tensor(bin_counts) and bin_counts.shape == self._bin_counts.shape:
+      self._bin_counts.copy_(bin_counts.to(device=self.device, dtype=self._bin_counts.dtype))
+
+  def _update_bin_errors(self, env_ids: torch.Tensor) -> None:
+    """Update EMA bin steady-state position errors for eligible settled environments."""
+    bins = self._bin_id[env_ids]
+    errs = self.metrics["position_error"][env_ids].detach()
+    valid = (bins >= 0) & (bins < self._bin_err.numel()) & torch.isfinite(errs)
+    if not bool(torch.any(valid)):
+      return
+    bins = bins[valid]
+    errs = errs[valid]
+    alpha = float(self.cfg.adaptive_ema_alpha)
+    for k in torch.unique(bins).tolist():
+      k_int = int(k)
+      mean_err = float(errs[bins == k_int].mean().item())
+      self._bin_err[k_int] = (1.0 - alpha) * self._bin_err[k_int] + alpha * mean_err
+      self._bin_counts[k_int] += 1
 
   @property
   def command(self) -> torch.Tensor:
@@ -616,6 +700,8 @@ class WbcEePoseCommand(CommandTerm):
       extras[metric_name] = torch.mean(metric_value[ids]).item()
       metric_value[ids] = 0.0
     self.command_counter[ids] = 0
+    self._bin_id[ids] = -1
+    self._cmd_age[ids] = 0.0
     nominal = self._nominal_pose(ids.shape[0])
     self._commit_pose(ids, nominal[:, :3], nominal[:, 3:7])
     self._pending_reset[ids] = True
@@ -625,6 +711,7 @@ class WbcEePoseCommand(CommandTerm):
     self, dt: float | torch.Tensor, env_ids: torch.Tensor | None = None
   ) -> None:
     """Flush pending post-reset resamples (post-forward) and advance active trajectories."""
+    just_reset = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
     if bool(torch.any(self._pending_reset)):
       if env_ids is None:
         pending_ids = self._pending_reset.nonzero(as_tuple=False).flatten()
@@ -634,7 +721,27 @@ class WbcEePoseCommand(CommandTerm):
         pending_ids = (self._pending_reset & scope).nonzero(as_tuple=False).flatten()
       if pending_ids.numel() > 0:
         self._pending_reset[pending_ids] = False
+        self._bin_id[pending_ids] = -1
+        self._cmd_age[pending_ids] = 0.0
+        just_reset[pending_ids] = True
         self._resample(pending_ids)
+
+    if env_ids is None:
+      if isinstance(dt, torch.Tensor):
+        dt_vec = dt.to(device=self.device, dtype=self._cmd_age.dtype).reshape(-1)
+        self._cmd_age = torch.where(just_reset, self._cmd_age, self._cmd_age + dt_vec)
+      else:
+        self._cmd_age[~just_reset] += float(dt)
+    else:
+      scope_ids = self._index_env_ids(env_ids)
+      non_reset = scope_ids[~just_reset[scope_ids]]
+      if non_reset.numel() > 0:
+        if isinstance(dt, torch.Tensor):
+          self._cmd_age[non_reset] += dt[non_reset].to(
+            device=self.device, dtype=self._cmd_age.dtype
+          )
+        else:
+          self._cmd_age[non_reset] += float(dt)
 
     self._pending_step_dt = dt
     try:
@@ -646,23 +753,40 @@ class WbcEePoseCommand(CommandTerm):
     env_ids = self._as_env_ids(env_ids)
     if env_ids.numel() == 0:
       return
-    goal_pos, goal_quat = self._sample_safe_goal(env_ids)
+    if self.cfg.adaptive_sampling:
+      eligible = (
+        (~self._pending_reset[env_ids])
+        & self._eval_env_mask[env_ids]
+        & (self._bin_id[env_ids] >= 0)
+        & (self._cmd_age[env_ids] >= float(self.cfg.adaptive_min_hold_s))
+        & (~self._traj_active[env_ids])
+      )
+      if bool(torch.any(eligible)):
+        self._update_bin_errors(env_ids[eligible])
+    self._cmd_age[env_ids] = 0.0
+    self._bin_id[env_ids] = -1
+
+    goal_pos, goal_quat, sampled_bins = self._sample_safe_goal_with_bins(env_ids)
     traj_prob = float(self.cfg.trajectory_mode_prob)
     if traj_prob <= 0.0:
       self._commit_pose(env_ids, goal_pos, goal_quat)
+      self._bin_id[env_ids] = sampled_bins
       return
     choose_traj = torch.rand(env_ids.shape[0], device=self.device) < traj_prob
     if bool(torch.any(~choose_traj)):
+      static_ids = env_ids[~choose_traj]
       self._commit_pose(
-        env_ids[~choose_traj],
+        static_ids,
         goal_pos[~choose_traj],
         goal_quat[~choose_traj],
       )
+      self._bin_id[static_ids] = sampled_bins[~choose_traj]
     if bool(torch.any(choose_traj)):
       self._start_trajectories(
         env_ids[choose_traj],
         goal_pos[choose_traj],
         goal_quat[choose_traj],
+        goal_bins=sampled_bins[choose_traj],
       )
 
   def _update_command(self, env_ids: torch.Tensor | None = None) -> None:
@@ -692,21 +816,50 @@ class WbcEePoseCommand(CommandTerm):
     self._certified_pose[active_mask] = cmd_7d
 
   def _sample_goal(self, env_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    position, quaternion, _ = self._sample_goal_with_bins(env_ids)
+    return position, quaternion
+
+  def _sample_goal_with_bins(
+    self, env_ids: torch.Tensor
+  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     count = env_ids.shape[0]
     ranges = self.cfg.ranges
     assert ranges is not None
-    x_lim = torch.tensor(ranges.pos_x, device=self.device)
-    y_lim = torch.tensor(ranges.pos_y, device=self.device)
-    z_lim = torch.tensor(ranges.pos_z, device=self.device)
-    rand_pos = torch.rand(count, 3, device=self.device)
-    position = torch.stack(
-      (
-        x_lim[0] + rand_pos[:, 0] * (x_lim[1] - x_lim[0]),
-        y_lim[0] + rand_pos[:, 1] * (y_lim[1] - y_lim[0]),
-        z_lim[0] + rand_pos[:, 2] * (z_lim[1] - z_lim[0]),
-      ),
-      dim=-1,
-    )
+    x_lim = torch.tensor(ranges.pos_x, device=self.device, dtype=torch.float32)
+    y_lim = torch.tensor(ranges.pos_y, device=self.device, dtype=torch.float32)
+    z_lim = torch.tensor(ranges.pos_z, device=self.device, dtype=torch.float32)
+
+    if self.cfg.adaptive_sampling:
+      n_x = int(self.cfg.adaptive_x_bins)
+      n_z = int(self.cfg.adaptive_z_bins)
+      probs = self.bin_probabilities()
+      bin_ids = torch.multinomial(probs, count, replacement=True)
+      ix = bin_ids // n_z
+      iz = bin_ids % n_z
+      u_x = (ix.to(dtype=x_lim.dtype) + torch.rand(count, device=self.device)) / float(n_x)
+      u_z = (iz.to(dtype=z_lim.dtype) + torch.rand(count, device=self.device)) / float(n_z)
+    else:
+      bin_ids = torch.full((count,), -1, dtype=torch.long, device=self.device)
+      u_x = torch.rand(count, device=self.device)
+      u_z = torch.rand(count, device=self.device)
+
+    dx = x_lim[1] - x_lim[0]
+    dz = z_lim[1] - z_lim[0]
+    x = x_lim[0].expand(count) if float(dx.abs().item()) < 1e-6 else (x_lim[0] + u_x * dx)
+    z = z_lim[0].expand(count) if float(dz.abs().item()) < 1e-6 else (z_lim[0] + u_z * dz)
+
+    r_max = self.cfg.max_xy_radius
+    if r_max is not None:
+      r_max_f = float(r_max)
+      x = x.clamp(min=-r_max_f, max=r_max_f)
+      y_cap = torch.sqrt((r_max_f * r_max_f - x * x).clamp(min=0.0))
+      y_lo_eff = y_lim[0].clamp(min=-y_cap, max=y_cap)
+      y_hi_eff = y_lim[1].clamp(min=-y_cap, max=y_cap)
+      y = y_lo_eff + torch.rand(count, device=self.device) * (y_hi_eff - y_lo_eff)
+    else:
+      y = y_lim[0] + torch.rand(count, device=self.device) * (y_lim[1] - y_lim[0])
+
+    position = torch.stack((x, y, z), dim=-1)
 
     roll_lim = torch.tensor(ranges.roll, device=self.device)
     pitch_lim = torch.tensor(ranges.pitch, device=self.device)
@@ -737,10 +890,15 @@ class WbcEePoseCommand(CommandTerm):
     quaternion = quat_from_euler_xyz(euler[:, 0], euler[:, 1], euler[:, 2])
     if self.cfg.make_quat_unique:
       quaternion = quat_unique(quaternion)
-    return position, quaternion
+    return position, quaternion, bin_ids
 
   def _start_trajectories(
-    self, env_ids: torch.Tensor, goal_pos: torch.Tensor, goal_quat: torch.Tensor
+    self,
+    env_ids: torch.Tensor,
+    goal_pos: torch.Tensor,
+    goal_quat: torch.Tensor,
+    *,
+    goal_bins: torch.Tensor | None = None,
   ) -> None:
     start_pos = self.pose_command[env_ids, :3].clone()
     start_quat = self.pose_command[env_ids, 3:7].clone()
@@ -773,7 +931,10 @@ class WbcEePoseCommand(CommandTerm):
 
     if bool(torch.any(~accepted)):
       self._hold_rejected_goals(
-        env_ids[~accepted], goal_pos[~accepted], goal_quat[~accepted]
+        env_ids[~accepted],
+        goal_pos[~accepted],
+        goal_quat[~accepted],
+        goal_bins=goal_bins[~accepted] if goal_bins is not None else None,
       )
     if not bool(torch.any(accepted)):
       return
@@ -791,6 +952,8 @@ class WbcEePoseCommand(CommandTerm):
       torch.ones_like(duration),
     )
     self.time_left[ids] = self._trajectory_time_left(duration)
+    if goal_bins is not None:
+      self._bin_id[ids] = goal_bins[accepted]
 
   def _curve_is_forbidden(
     self,
@@ -842,38 +1005,54 @@ class WbcEePoseCommand(CommandTerm):
   def _sample_safe_goal(
     self, env_ids: torch.Tensor
   ) -> tuple[torch.Tensor, torch.Tensor]:
+    goal_pos, goal_quat, _ = self._sample_safe_goal_with_bins(env_ids)
+    return goal_pos, goal_quat
+
+  def _sample_safe_goal_with_bins(
+    self, env_ids: torch.Tensor
+  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     count = env_ids.shape[0]
     goal_pos = torch.empty(count, 3, device=self.device)
     goal_quat = torch.empty(count, 4, device=self.device)
+    sampled_bins = torch.full((count,), -1, dtype=torch.long, device=self.device)
     pending = torch.ones(count, dtype=torch.bool, device=self.device)
     for _ in range(_GOAL_SAMPLE_ATTEMPTS):
       if not bool(torch.any(pending)):
         break
-      sampled_pos, sampled_quat = self._sample_goal(env_ids[pending])
+      sampled_pos, sampled_quat, bins = self._sample_goal_with_bins(env_ids[pending])
       bad = self._positions_forbidden(env_ids[pending], sampled_pos)
       index = pending.nonzero(as_tuple=False).flatten()
       good = ~bad
       if bool(torch.any(good)):
         goal_pos[index[good]] = sampled_pos[good]
         goal_quat[index[good]] = sampled_quat[good]
+        sampled_bins[index[good]] = bins[good]
         pending[index[good]] = False
     if bool(torch.any(pending)):
       fallback_pos, fallback_quat = self._fallback_pose(env_ids[pending])
       goal_pos[pending] = fallback_pos
       goal_quat[pending] = fallback_quat
-    return goal_pos, goal_quat
+    return goal_pos, goal_quat, sampled_bins
 
   def _hold_rejected_goals(
-    self, env_ids: torch.Tensor, goal_pos: torch.Tensor, goal_quat: torch.Tensor
+    self,
+    env_ids: torch.Tensor,
+    goal_pos: torch.Tensor,
+    goal_quat: torch.Tensor,
+    *,
+    goal_bins: torch.Tensor | None = None,
   ) -> None:
     goal_bad = self._positions_forbidden(env_ids, goal_pos)
     if bool(torch.any(~goal_bad)):
-      self._commit_pose(
-        env_ids[~goal_bad], goal_pos[~goal_bad], goal_quat[~goal_bad]
-      )
+      ok_ids = env_ids[~goal_bad]
+      self._commit_pose(ok_ids, goal_pos[~goal_bad], goal_quat[~goal_bad])
+      if goal_bins is not None:
+        self._bin_id[ok_ids] = goal_bins[~goal_bad]
     if bool(torch.any(goal_bad)):
-      fallback_pos, fallback_quat = self._fallback_pose(env_ids[goal_bad])
-      self._commit_pose(env_ids[goal_bad], fallback_pos, fallback_quat)
+      bad_ids = env_ids[goal_bad]
+      fallback_pos, fallback_quat = self._fallback_pose(bad_ids)
+      self._commit_pose(bad_ids, fallback_pos, fallback_quat)
+      self._bin_id[bad_ids] = -1
 
   def _fallback_pose(
     self, env_ids: torch.Tensor
@@ -986,6 +1165,17 @@ class WbcEePoseCommandCfg(CommandTermCfg):
   trajectory_curve_prob: float = 0.5
   trajectory_step_dt: float = 0.02
   ori_abs_max: tuple[float, float, float] | None = None
+  # Adaptive error-weighted command sampling (2D normalized x-z bins)
+  adaptive_sampling: bool = True
+  adaptive_x_bins: int = 3
+  adaptive_z_bins: int = 5
+  adaptive_uniform_prob: float = 0.3
+  adaptive_beta: float = 1.25
+  adaptive_err_clip: tuple[float, float] = (0.02, 0.20)
+  adaptive_ema_alpha: float = 0.05
+  adaptive_min_hold_s: float = 2.0
+  adaptive_init_err: float = 0.05
+  max_xy_radius: float | None = 0.69
   initial_ranges: Ranges = field(
     default_factory=lambda: WbcEePoseCommandCfg.Ranges(
       pos_x=(0.40, 0.45),
@@ -1002,6 +1192,40 @@ class WbcEePoseCommandCfg(CommandTermCfg):
   def __post_init__(self) -> None:
     if self.stage not in (1, 2):
       raise ValueError(f"stage must be 1 or 2, got {self.stage}")
+    if self.adaptive_x_bins < 1:
+      raise ValueError(f"adaptive_x_bins must be >= 1, got {self.adaptive_x_bins}")
+    if self.adaptive_z_bins < 1:
+      raise ValueError(f"adaptive_z_bins must be >= 1, got {self.adaptive_z_bins}")
+    if not (0.0 <= float(self.adaptive_uniform_prob) <= 1.0):
+      raise ValueError(
+        f"adaptive_uniform_prob must be in [0.0, 1.0], got {self.adaptive_uniform_prob}"
+      )
+    if float(self.adaptive_beta) < 0.0:
+      raise ValueError(f"adaptive_beta must be >= 0.0, got {self.adaptive_beta}")
+    if (
+      len(self.adaptive_err_clip) != 2
+      or float(self.adaptive_err_clip[0]) <= 0.0
+      or float(self.adaptive_err_clip[1]) < float(self.adaptive_err_clip[0])
+    ):
+      raise ValueError(
+        f"adaptive_err_clip must satisfy 0 < lo <= hi, got {self.adaptive_err_clip}"
+      )
+    if not (0.0 < float(self.adaptive_ema_alpha) <= 1.0):
+      raise ValueError(
+        f"adaptive_ema_alpha must be in (0.0, 1.0], got {self.adaptive_ema_alpha}"
+      )
+    if float(self.adaptive_min_hold_s) < 0.0:
+      raise ValueError(
+        f"adaptive_min_hold_s must be >= 0.0, got {self.adaptive_min_hold_s}"
+      )
+    if float(self.adaptive_init_err) <= 0.0:
+      raise ValueError(
+        f"adaptive_init_err must be > 0.0, got {self.adaptive_init_err}"
+      )
+    if self.max_xy_radius is not None and float(self.max_xy_radius) <= 0.0:
+      raise ValueError(
+        f"max_xy_radius must be > 0.0 when set, got {self.max_xy_radius}"
+      )
     if (
       self.trajectory_duration_range[0] <= 0.0
       or self.trajectory_duration_range[1] < self.trajectory_duration_range[0]
@@ -1018,7 +1242,7 @@ class WbcEePoseCommandCfg(CommandTermCfg):
       self.limit_ranges = WbcEePoseCommandCfg.Ranges(
         pos_x=(0.45, 0.70),
         pos_y=(-0.35, 0.35),
-        pos_z=(0.10, 0.80),
+        pos_z=(0.10, 0.95),
         roll=(-r_lim, r_lim),
         pitch=(-p_lim, p_lim),
         yaw=(-y_lim, y_lim),

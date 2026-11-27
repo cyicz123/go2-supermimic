@@ -82,9 +82,17 @@ class WbcTrainer:
         debug_vis=True,
       )
 
+    ee_cmd_cfg = env_cfg.commands["ee_pose"]
+    ee_cmd_cfg.adaptive_sampling = bool(cfg.ee_adaptive_sampling)
+    ee_cmd_cfg.adaptive_uniform_prob = float(cfg.ee_adaptive_uniform_prob)
+    ee_cmd_cfg.max_xy_radius = (
+      float(cfg.ee_max_xy_radius) if cfg.ee_max_xy_radius is not None else None
+    )
+
     env_cfg.scene.num_envs = cfg.num_envs
     env_cfg.seed = cfg.seed
 
+    init_progress = max(0.0, min(1.0, float(cfg.initial_curriculum_progress)))
     saved_step = 0
     new_end_step = int(cfg.target_curriculum_iterations)
     if resume_ckpt is not None and cfg.continue_run:
@@ -120,9 +128,14 @@ class WbcTrainer:
             params["end_step"] = max(saved_step + 1, new_end_step)
             params["init_progress"] = float(resume_ckpt[pkey])
     else:
+      if init_progress > 0.0:
+        env_cfg.commands["base_velocity"].curriculum_progress = init_progress
+        env_cfg.commands["ee_pose"].curriculum_progress = init_progress
       for cname in ("base_velocity_levels", "ee_pose_levels"):
         if cname in env_cfg.curriculum:
           env_cfg.curriculum[cname].params["end_step"] = new_end_step
+          if init_progress > 0.0:
+            env_cfg.curriculum[cname].params["init_progress"] = init_progress
 
     self.env_cfg = env_cfg
     self.env = ManagerBasedRlEnv(cfg=env_cfg, device="cuda:0")
@@ -131,6 +144,9 @@ class WbcTrainer:
     if resume_ckpt is not None and cfg.continue_run:
       # Restore common_step_counter and sync command curricula BEFORE the very first reset().
       self.env.common_step_counter = saved_step
+      self.env.curriculum_manager.compute()
+    elif init_progress > 0.0:
+      # Sync initial_curriculum_progress BEFORE the very first reset().
       self.env.curriculum_manager.compute()
 
     obs, _ = self.env.reset()
@@ -192,13 +208,22 @@ class WbcTrainer:
     self.explore = (
       torch.arange(cfg.num_envs, device=self.dev) < int(cfg.explore_frac * cfg.num_envs)
     )
+    ee_term = self.env.command_manager.get_term("ee_pose")
+    if hasattr(ee_term, "set_eval_env_mask"):
+      ee_term.set_eval_env_mask(~self.explore)
     self.ou = torch.zeros(cfg.num_envs, wbc_st.WBC_NUM_JOINTS, device=self.dev)
+
+    weights = WbcRewardWeights()
+    if getattr(cfg, "wbc_flat_orientation_l2", None) is not None:
+      weights.flat_orientation_l2 = float(cfg.wbc_flat_orientation_l2)
+    if getattr(cfg, "wbc_ee_pos_exp", None) is not None:
+      weights.ee_pos_exp = float(cfg.wbc_ee_pos_exp)
 
     imag_cfg = WbcImagineCfg(
       horizon=cfg.horizon,
       compile=cfg.compile,
       sensor_grad=cfg.sensor_grad,
-      weights=WbcRewardWeights(),
+      weights=weights,
     )
     self.imag = WbcImagination(
       imag_cfg,
@@ -293,6 +318,10 @@ class WbcTrainer:
       )
 
     print(f"resumed from {path} (iteration {ckpt.get('iteration')})", flush=True)
+    if not self.cfg.reset_critic and "ee_adaptive_state" in ckpt:
+      ee_term = self.env.command_manager.get_term("ee_pose")
+      if hasattr(ee_term, "load_adaptive_state_dict"):
+        ee_term.load_adaptive_state_dict(ckpt["ee_adaptive_state"])
     if self.cfg.continue_run:
       self.start_it = int(ckpt.get("iteration", 0))
       self.it = self.start_it
@@ -558,6 +587,9 @@ class WbcTrainer:
         "vel_curriculum_progress": float(vel_term.cfg.curriculum_progress),
         "ee_curriculum_progress": float(ee_term.cfg.curriculum_progress),
         "curriculum_state": curriculum_state,
+        "ee_adaptive_state": (
+          ee_term.adaptive_state_dict() if hasattr(ee_term, "adaptive_state_dict") else None
+        ),
         "cfg": asdict(self.cfg),
         "actor": self.actor.state_dict(),
         "critic": self.critic.state_dict(),
@@ -648,6 +680,17 @@ class WbcTrainer:
             ):
               line.append(f"{k_ep.split('/')[-1]} {mean:.3g}")
           self.ep_stats.clear()
+          ee_term = self.env.command_manager.get_term("ee_pose")
+          if hasattr(ee_term, "adaptive_metrics"):
+            adapt_m = ee_term.adaptive_metrics()
+            for k_a, v_a in adapt_m.items():
+              self.writer.add_scalar(f"ee_adaptive/{k_a}", v_a, it)
+            line.append(
+              f"ee_adapt p_lo={adapt_m['prob_low_z']:.3f} p_hi={adapt_m['prob_high_z']:.3f} "
+              f"p_max={adapt_m['prob_max']:.3f} e_lo={adapt_m['err_low_z']:.3f} "
+              f"e_hi={adapt_m['err_high_z']:.3f}"
+            )
+          line.append(f"cur_ee={ee_term.cfg.curriculum_progress:.2f}")
           line.extend(gait_line)
           self.writer.add_scalar("time/minutes", elapsed / 60, it)
           print(" | ".join(line), flush=True)
