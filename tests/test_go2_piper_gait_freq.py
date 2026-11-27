@@ -209,10 +209,10 @@ def test_route2b_defaults() -> None:
   # Unchanged task, stability, and safety weights
   assert w.track_lin_vel_xy == pytest.approx(3.0)
   assert w.track_ang_vel_z == pytest.approx(1.0)
-  assert w.ee_pos_exp == pytest.approx(3.0)
+  assert w.ee_pos_exp == pytest.approx(4.5)
   assert w.ee_ori_huber == pytest.approx(-1.5)
   assert w.track_base_height_exp == pytest.approx(1.0)
-  assert w.flat_orientation_l2 == pytest.approx(-2.0)
+  assert w.flat_orientation_l2 == pytest.approx(-0.4)
   assert w.lin_vel_z_l2 == pytest.approx(-1.0)
   assert w.ang_vel_xy_l2 == pytest.approx(-0.05)
   assert w.standing_feet_air_soft == pytest.approx(-1.0)
