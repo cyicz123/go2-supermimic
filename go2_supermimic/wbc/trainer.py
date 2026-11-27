@@ -33,6 +33,14 @@ from go2_supermimic.wbc.imagine import (
 )
 
 
+def _clone_inference_buffers(module: torch.nn.Module) -> None:
+  """Replace any inference-mode buffers with normal tensors before load_state_dict."""
+  for mod in module.modules():
+    for name, buf in list(mod._buffers.items()):
+      if buf is not None and buf.is_inference():
+        mod._buffers[name] = buf.detach().clone()
+
+
 @dataclass(kw_only=True)
 class WbcTrainCfg(TrainCfg):
   """Training defaults tailored for pure from-scratch 18-DoF Go2+Piper WBC."""
@@ -719,6 +727,8 @@ class WbcTrainer:
     self.collapse_strikes += 1
     if self.collapse_strikes >= 2 and self.last_ckpt is not None:
       ckpt = torch.load(self.last_ckpt, map_location=self.dev, weights_only=False)
+      _clone_inference_buffers(self.actor)
+      _clone_inference_buffers(self.critic)
       self.actor.load_state_dict(ckpt["actor"])
       self.critic.load_state_dict(ckpt["critic"])
       self.lr_scale *= 0.5
