@@ -216,8 +216,18 @@ class WbcTrainer:
     weights = WbcRewardWeights()
     if getattr(cfg, "wbc_flat_orientation_l2", None) is not None:
       weights.flat_orientation_l2 = float(cfg.wbc_flat_orientation_l2)
+    if getattr(cfg, "wbc_flat_roll_l2", None) is not None:
+      weights.flat_roll_l2 = float(cfg.wbc_flat_roll_l2)
+    if getattr(cfg, "wbc_flat_pitch_l2", None) is not None:
+      weights.flat_pitch_l2 = float(cfg.wbc_flat_pitch_l2)
     if getattr(cfg, "wbc_ee_pos_exp", None) is not None:
       weights.ee_pos_exp = float(cfg.wbc_ee_pos_exp)
+    print(
+      f"wbc_weights: flat_orientation_l2={weights.flat_orientation_l2} "
+      f"flat_roll_l2={weights.flat_roll_l2} flat_pitch_l2={weights.flat_pitch_l2} "
+      f"ee_pos_exp={weights.ee_pos_exp}",
+      flush=True,
+    )
 
     imag_cfg = WbcImagineCfg(
       horizon=cfg.horizon,

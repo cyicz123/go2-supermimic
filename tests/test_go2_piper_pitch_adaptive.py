@@ -406,3 +406,96 @@ def test_ee_adaptive_checkpoint_roundtrip_and_backcompat(tmp_path: Path) -> None
     assert math.isfinite(ee_term4.adaptive_metrics()["prob_low_z"])
   finally:
     t4.close()
+
+
+def test_split_roll_pitch_orientation_penalty() -> None:
+  from mjlab.utils.lab_api.math import quat_apply_inverse, quat_from_euler_xyz
+
+  # Verify body-frame projected gravity axis convention:
+  # pure roll (rot around X) -> g_y != 0, g_x == 0; pure pitch (rot around Y) -> g_x != 0, g_y == 0.
+  g_world = torch.tensor([[0.0, 0.0, -1.0], [0.0, 0.0, -1.0]])
+  q_angles = quat_from_euler_xyz(
+    torch.tensor([0.3, 0.0]),
+    torch.tensor([0.0, 0.3]),
+    torch.tensor([0.0, 0.0]),
+  )
+  g_rot = quat_apply_inverse(q_angles, g_world)
+  assert g_rot[0, 0].item() == pytest.approx(0.0, abs=1e-6)
+  assert abs(g_rot[0, 1].item()) > 0.25
+  assert abs(g_rot[1, 0].item()) > 0.25
+  assert g_rot[1, 1].item() == pytest.approx(0.0, abs=1e-6)
+
+  dt = 0.02
+  imag_zero = WbcImagination(
+    WbcImagineCfg(dt=dt, weights=WbcRewardWeights(flat_orientation_l2=0.0)),
+    _synthetic_consts(3),
+    "cpu",
+  )
+  imag_default = WbcImagination(
+    WbcImagineCfg(dt=dt, weights=WbcRewardWeights(flat_orientation_l2=-0.4)),
+    _synthetic_consts(3),
+    "cpu",
+  )
+  imag_none = WbcImagination(
+    WbcImagineCfg(
+      dt=dt,
+      weights=WbcRewardWeights(
+        flat_orientation_l2=-0.4, flat_roll_l2=None, flat_pitch_l2=None
+      ),
+    ),
+    _synthetic_consts(3),
+    "cpu",
+  )
+  imag_split = WbcImagination(
+    WbcImagineCfg(
+      dt=dt,
+      weights=WbcRewardWeights(
+        flat_orientation_l2=-0.4, flat_roll_l2=-1.5, flat_pitch_l2=-0.4
+      ),
+    ),
+    _synthetic_consts(3),
+    "cpu",
+  )
+
+  # Batch: [0] upright, [1] pure roll (g_y=0.3, g_x=0), [2] pure pitch (g_x=0.3, g_y=0)
+  s0 = _make_standing_state(3, "cpu")
+  s1 = _make_standing_state(3, "cpu")
+  s1[1, wbc_st.GRAV] = torch.tensor([0.0, 0.3, -math.sqrt(1.0 - 0.09)])
+  s1[2, wbc_st.GRAV] = torch.tensor([0.3, 0.0, -math.sqrt(1.0 - 0.09)])
+  pose0 = torch.zeros(3, 3)
+  pose1 = torch.zeros(3, 3)
+  a = torch.zeros(3, WBC_NUM_JOINTS)
+  a_prev = torch.zeros(3, WBC_NUM_JOINTS)
+  q_ref_arm = torch.zeros(3, WBC_NUM_ARM_JOINTS)
+  cmd_vel = torch.zeros(3, 3)
+  ee_cmd = torch.tensor([[0.5, 0.0, 0.4, 1.0, 0.0, 0.0, 0.0]]).expand(3, 7)
+  xi = torch.ones(3, WBC_CONTEXT_DIM)
+  k = imag_default.rollout_constants(torch.arange(3))
+
+  r_zero, _ = imag_zero.compute_rewards(
+    s0, s1, pose0, pose1, a, a_prev, q_ref_arm, cmd_vel, ee_cmd, xi, k
+  )
+  r_def, t_def = imag_default.compute_rewards(
+    s0, s1, pose0, pose1, a, a_prev, q_ref_arm, cmd_vel, ee_cmd, xi, k
+  )
+  r_none, _ = imag_none.compute_rewards(
+    s0, s1, pose0, pose1, a, a_prev, q_ref_arm, cmd_vel, ee_cmd, xi, k
+  )
+  r_spl, t_spl = imag_split.compute_rewards(
+    s0, s1, pose0, pose1, a, a_prev, q_ref_arm, cmd_vel, ee_cmd, xi, k
+  )
+
+  # Default mode (flat_roll_l2=None, flat_pitch_l2=None) must match exact -0.4 * (gx^2 + gy^2)
+  assert torch.equal(r_def, r_none)
+  assert torch.allclose(t_def["flat_orientation_l2"], t_spl["flat_orientation_l2"], atol=1e-7)
+
+  # Upright [0] and pure pitch [2] (-0.4 == -0.4) have identical total rewards across default & split
+  assert r_spl[0].item() == pytest.approx(r_def[0].item(), abs=1e-7)
+  assert r_spl[2].item() == pytest.approx(r_def[2].item(), abs=1e-7)
+
+  # Pure roll [1] receives exact -1.5 * gy^2 * dt, pure pitch [2] receives -0.4 * gx^2 * dt
+  pen_roll = (r_spl[1] - r_zero[1]).item() / dt
+  pen_pitch = (r_spl[2] - r_zero[2]).item() / dt
+  assert pen_roll == pytest.approx(-1.5 * (0.3**2), rel=1e-5)
+  assert pen_pitch == pytest.approx(-0.4 * (0.3**2), rel=1e-5)
+  assert (pen_roll / pen_pitch) == pytest.approx(3.75, rel=1e-5)

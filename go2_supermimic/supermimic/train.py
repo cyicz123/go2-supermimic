@@ -141,6 +141,10 @@ class TrainCfg:
   """Analytic XY radius cap [m] in link0 frame for ee_pose command sampling."""
   wbc_flat_orientation_l2: float | None = None
   """Optional override for WbcRewardWeights.flat_orientation_l2."""
+  wbc_flat_roll_l2: float | None = None
+  """Optional override for WbcRewardWeights.flat_roll_l2."""
+  wbc_flat_pitch_l2: float | None = None
+  """Optional override for WbcRewardWeights.flat_pitch_l2."""
   wbc_ee_pos_exp: float | None = None
   """Optional override for WbcRewardWeights.ee_pos_exp."""
 
