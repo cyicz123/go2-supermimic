@@ -83,7 +83,7 @@ class TrainCfg:
   """Initial weight of the jump/duck hint (training wheels for the bars)."""
   dodge_shaping_decay_iterations: int = 20_000
   """The hint weight decays linearly to 0 over this many iterations."""
-  target_curriculum_iterations: int = 15_000
+  target_curriculum_iterations: int = 3_000
   """Iterations over which the targets reach full difficulty. The env-side
   curriculum counts env steps, and this loop takes one env step per iteration
   (PPO takes 24), so it is set here explicitly."""
