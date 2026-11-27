@@ -218,11 +218,45 @@ def quat_geodesic_angle(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
 
 def soft_contact_prob(
   z_foot: torch.Tensor,
-  contact_height: float = 0.032,
-  tau: float = 0.006,
+  contact_height: float = 0.0255,
+  tau: float = 0.0030,
 ) -> torch.Tensor:
   """Smooth foot contact probability ``sigmoid((h_contact - z_foot) / tau)``."""
   return torch.sigmoid((contact_height - z_foot) / tau)
+
+
+def _make_tukey25_window(
+  horizon: int,
+  device: torch.device,
+  dtype: torch.dtype,
+) -> torch.Tensor:
+  """Unit-L2-norm Tukey window (alpha=0.25) over ``horizon`` steps."""
+  idx = torch.arange(horizon, device=device, dtype=dtype)
+  u = (idx + 0.5) / max(horizon, 1)
+  w = torch.ones_like(u)
+  left = u < 0.125
+  right = u > 0.875
+  w[left] = 0.5 * (1.0 - torch.cos(math.pi * u[left] / 0.125))
+  w[right] = 0.5 * (1.0 - torch.cos(math.pi * (1.0 - u[right]) / 0.125))
+  return w / torch.linalg.norm(w).clamp_min(1e-8)
+
+
+def _make_fourier_basis(
+  f_min: float,
+  f_max: float,
+  df: float,
+  horizon: int,
+  dt: float,
+  device: torch.device,
+  dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+  """Midpoint-quadrature Parseval real cosine/sine projection matrices ``(H, K)``."""
+  n_bins = int(round((f_max - f_min) / df))
+  freqs = f_min + (torch.arange(n_bins, device=device, dtype=dtype) + 0.5) * df
+  t = torch.arange(horizon, device=device, dtype=dtype).unsqueeze(1) * dt
+  ang = 2.0 * math.pi * t * freqs.unsqueeze(0)
+  scale = math.sqrt(2.0 * dt * df)
+  return scale * torch.cos(ang), scale * torch.sin(ang), freqs
 
 
 def box_sdf_penetration(
@@ -280,18 +314,22 @@ class WbcRewardWeights:
   lin_vel_z_l2: float = -1.0
   ang_vel_xy_l2: float = -0.05
   # Differentiable gait
-  feet_slide_world_soft: float = -0.5
-  feet_clearance_soft: float = -40.0
+  feet_slide_world_soft: float = -0.80
+  feet_clearance_soft: float = -25.0
   standing_feet_air_soft: float = -1.0
   leg_joint_pos: float = -0.1
-  diagonal_trot_soft: float = -0.30
+  diagonal_trot_soft: float = -0.25
   joint_mirror: float = -0.05
-  contact_switch_tv: float = -0.30
+  contact_switch_tv: float = 0.0
   contact_switch_l2: float = 0.0
+  # Route 2B window-level gait shaping
+  gait_bandpass: float = 1.20
+  gait_peak_lse: float = -220.0
+  gait_diag_corr: float = 0.45
   # Smoothness & safety
   action_rate_leg_l2: float = -0.03
   action_rate_arm_l2: float = -0.02
-  leg_joint_acc_l2: float = -3.0e-7
+  leg_joint_acc_l2: float = -2.5e-7
   joint_power: float = -2.0e-4
   joint_torques_l2: float = -2.0e-5
   dof_pos_limits: float = -1.0
@@ -319,9 +357,14 @@ class WbcImagineCfg:
   ee_ori_delta: float = 0.5
   base_height_target: float = 0.30
   base_height_sigma: float = 0.05
-  contact_height_m: float = 0.032
-  contact_tau_m: float = 0.006
-  foot_clearance_target: float = 0.06
+  contact_height_m: float = 0.0255
+  contact_tau_m: float = 0.0030
+  foot_clearance_target: float = 0.065
+  gait_eps_energy: float = 4.0e-5
+  gait_sub_band_weight: float = 1.15
+  gait_high_band_weight: float = 0.55
+  gait_peak_beta: float = 180.0
+  gait_peak_lme_target_m: float = 0.056
   cmd_lin_thresh: float = 0.05
   cmd_ang_thresh: float = 0.05
   arm_vel_limit: float = 2.85
@@ -366,6 +409,31 @@ class WbcImagination:
       self._col_baseline = float(
         torch.sigmoid(torch.tensor(-cfg.col_pen_margin / cfg.col_tau)).item()
       )
+      horizon = int(cfg.horizon)
+      dt = float(cfg.dt)
+      self._tukey_win = _make_tukey25_window(horizon, self.device, torch.float32)
+      self._c_sub, self._s_sub, _ = _make_fourier_basis(
+        0.00, 1.40, 0.20, horizon, dt, self.device, torch.float32
+      )
+      self._c_pass, self._s_pass, _ = _make_fourier_basis(
+        2.00, 3.00, 0.20, horizon, dt, self.device, torch.float32
+      )
+      self._c_high, self._s_high, _ = _make_fourier_basis(
+        4.40, 12.40, 0.40, horizon, dt, self.device, torch.float32
+      )
+      self._c_diag, self._s_diag, self._f_diag = _make_fourier_basis(
+        0.50, 12.50, 0.25, horizon, dt, self.device, torch.float32
+      )
+      self._w_corr = torch.tensor(
+        [
+          [0.0, -1.0, -1.0, 1.0],
+          [-1.0, 0.0, 1.0, -1.0],
+          [-1.0, 1.0, 0.0, -1.0],
+          [1.0, -1.0, -1.0, 0.0],
+        ],
+        device=self.device,
+        dtype=torch.float32,
+      ) / 12.0
     self._step_fn = torch.compile(self._step, dynamic=False) if cfg.compile else self._step
 
   def relief(
@@ -516,7 +584,7 @@ class WbcImagination:
     pens1: torch.Tensor | None = None,
   ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute differentiable per-step WBC rewards ``(total * dt, terms)``."""
-    total, terms, _ = self._compute_rewards_and_gait(
+    total, terms, _, _ = self._compute_rewards_and_gait(
       s0,
       s1,
       pose0,
@@ -553,7 +621,7 @@ class WbcImagination:
     ground_z0: torch.Tensor | None = None,
     ground_z1: torch.Tensor | None = None,
     pens1: torch.Tensor | None = None,
-  ) -> tuple[torch.Tensor, dict[str, torch.Tensor], torch.Tensor]:
+  ) -> tuple[torch.Tensor, dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
     cfg, w = self.cfg, self.cfg.weights
     gz0 = tr.ground(pose0[..., :2], self.field) if ground_z0 is None else ground_z0
     gz1 = tr.ground(pose1[..., :2], self.field) if ground_z1 is None else ground_z1
@@ -724,7 +792,7 @@ class WbcImagination:
         ],
         dim=-1,
       )
-    return total * cfg.dt, terms, gait_diag
+    return total * cfg.dt, terms, gait_diag, z_foot
 
   def _step(
     self,
@@ -777,7 +845,7 @@ class WbcImagination:
 
     fk_next = piper_fk(s_next[..., Q_ARM] + k["default_arm"])
     d, pens_next, _ = self.termination_prob(s_next, fk_next)
-    r, _, gait_diag = self._compute_rewards_and_gait(
+    r, _, gait_diag, z_foot = self._compute_rewards_and_gait(
       s,
       s_next,
       pose,
@@ -819,7 +887,136 @@ class WbcImagination:
       d,
       crit_in,
       gait_diag,
+      z_foot,
     )
+
+  def compute_window_gait_rewards(
+    self,
+    z_foot_seq: torch.Tensor,
+    v_xy_seq: torch.Tensor | None,
+    wz_seq: torch.Tensor | None,
+    cmd_vel: torch.Tensor,
+    surv_after_seq: torch.Tensor | None = None,
+  ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Compute Route 2B window-level gait rate ``[/s]`` and diagnostics over ``[B, H, 4]``."""
+    cfg = self.cfg
+    w = cfg.weights
+    B, H, _ = z_foot_seq.shape
+    if H != int(self._tukey_win.shape[0]):
+      raise ValueError(f"Expected horizon {int(self._tukey_win.shape[0])}, got {H}")
+    dtype = z_foot_seq.dtype
+    device = z_foot_seq.device
+
+    lin_norm = torch.sqrt((cmd_vel[:, :2] * cmd_vel[:, :2]).sum(dim=-1) + 1e-12)
+    wz_abs = cmd_vel[:, 2].abs()
+    moving_mask = (
+      (lin_norm > cfg.cmd_lin_thresh) | (wz_abs > cfg.cmd_ang_thresh)
+    ).to(dtype=dtype)
+    lin_drive = F.relu(lin_norm - cfg.cmd_lin_thresh) / 0.20
+    ang_drive = F.relu(wz_abs - cfg.cmd_ang_thresh) / 0.30
+    gait_gate = moving_mask * (
+      0.35 + 0.65 * torch.maximum(lin_drive, ang_drive).clamp(0.0, 1.0)
+    )
+
+    if surv_after_seq is None:
+      surv_det = torch.ones((B, H), device=device, dtype=dtype)
+    else:
+      surv_det = surv_after_seq.detach().to(device=device, dtype=dtype)
+
+    win = self._tukey_win.to(device=device, dtype=dtype)
+    w_raw = win.view(1, 1, H) * surv_det.unsqueeze(1)
+    w_norm = w_raw / torch.sqrt(w_raw.square().sum(dim=-1, keepdim=True) + 1e-8)
+    w_sum = w_norm.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+    surv_mean = surv_det.mean(dim=-1)
+
+    if v_xy_seq is not None and wz_seq is not None:
+      s_w = surv_det / surv_det.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+      v_bar = (v_xy_seq * s_w.unsqueeze(-1)).sum(dim=1)
+      wz_bar = (wz_seq * s_w).sum(dim=1)
+      v_err_sq = (v_bar - cmd_vel[:, :2]).square().sum(dim=-1) + (
+        0.24 * (wz_bar - cmd_vel[:, 2])
+      ).square()
+      v_cmd_eff = torch.sqrt(
+        cmd_vel[:, :2].square().sum(dim=-1) + (0.24 * cmd_vel[:, 2]).square() + 1e-12
+      )
+      sigma_prog = 0.50 * v_cmd_eff + 0.08
+      prog_gate = torch.exp(-v_err_sq / (sigma_prog * sigma_prog))
+    else:
+      prog_gate = torch.ones_like(gait_gate)
+
+    zt = z_foot_seq.permute(0, 2, 1)  # [B, 4, H]
+    mu_w = (zt * w_norm).sum(dim=-1, keepdim=True) / w_sum
+    y = w_norm * (zt - mu_w)
+
+    e_tot = y.square().sum(dim=-1)
+    denom = e_tot + cfg.gait_eps_energy
+
+    c_sub = self._c_sub.to(device=device, dtype=dtype)
+    s_sub = self._s_sub.to(device=device, dtype=dtype)
+    c_pass = self._c_pass.to(device=device, dtype=dtype)
+    s_pass = self._s_pass.to(device=device, dtype=dtype)
+    c_high = self._c_high.to(device=device, dtype=dtype)
+    s_high = self._s_high.to(device=device, dtype=dtype)
+
+    e_sub = (y @ c_sub).square().sum(dim=-1) + (y @ s_sub).square().sum(dim=-1)
+    e_pass = (y @ c_pass).square().sum(dim=-1) + (y @ s_pass).square().sum(dim=-1)
+    e_high = (y @ c_high).square().sum(dim=-1) + (y @ s_high).square().sum(dim=-1)
+
+    rho_sub = (e_sub / denom).mean(dim=-1)
+    rho_pass = (e_pass / denom).mean(dim=-1)
+    rho_high = (e_high / denom).mean(dim=-1)
+
+    gait_bandpass_raw = (
+      rho_pass
+      - cfg.gait_sub_band_weight * rho_sub
+      - cfg.gait_high_band_weight * rho_high
+    )
+    gait_bandpass = (
+      prog_gate * F.relu(gait_bandpass_raw) - F.relu(-gait_bandpass_raw)
+    ) * gait_gate * surv_mean
+
+    z_clamped = zt.clamp(min=-0.05, max=0.12)
+    s_mask = surv_det.unsqueeze(1)
+    z_for_peak = s_mask * z_clamped + (1.0 - s_mask) * 0.0205
+    z_peak_lme = (
+      torch.logsumexp(cfg.gait_peak_beta * z_for_peak, dim=-1) - math.log(H)
+    ) / cfg.gait_peak_beta
+    peak_deficit_sq = F.relu(cfg.gait_peak_lme_target_m - z_peak_lme).square().mean(dim=-1)
+    gait_peak_lse = peak_deficit_sq * gait_gate * surv_mean
+
+    y_hat = y / torch.sqrt(denom.unsqueeze(-1))
+    gram = y_hat @ y_hat.transpose(-1, -2)
+    w_corr = self._w_corr.to(device=device, dtype=dtype)
+    diag_corr_raw = (gram * w_corr).sum(dim=(-1, -2))
+    gait_diag_corr = (
+      prog_gate * F.relu(diag_corr_raw) - F.relu(-diag_corr_raw)
+    ) * gait_gate * surv_mean
+
+    r_win_rate = (
+      w.gait_bandpass * gait_bandpass
+      + w.gait_peak_lse * gait_peak_lse
+      + w.gait_diag_corr * gait_diag_corr
+    )
+
+    with torch.no_grad():
+      c_diag = self._c_diag.to(device=device, dtype=dtype)
+      s_diag = self._s_diag.to(device=device, dtype=dtype)
+      f_diag = self._f_diag.to(device=device, dtype=dtype)
+      psd = (y @ c_diag).square() + (y @ s_diag).square()
+      psd_mean = psd.mean(dim=1)
+      f_peak_hz = f_diag[psd_mean.argmax(dim=-1)]
+
+    return r_win_rate, {
+      "gait_bandpass": gait_bandpass,
+      "gait_peak_lse": gait_peak_lse,
+      "gait_diag_corr": gait_diag_corr,
+      "rho_pass": rho_pass,
+      "rho_sub": rho_sub,
+      "rho_high": rho_high,
+      "z_peak_lme": z_peak_lme.mean(dim=-1),
+      "diag_corr_raw": diag_corr_raw,
+      "f_peak_hz": f_peak_hz,
+    }
 
   def rollout(
     self,
@@ -867,8 +1064,10 @@ class WbcImagination:
       ret = torch.zeros(B, device=self.device, dtype=s.dtype)
       disc = 1.0
       rewards, survs, conts, crit_in, gait_diags = [], [], [], [], []
+      disc_survs, z_feet, v_xys, wzs, survs_after = [], [], [], [], []
       for _ in range(cfg.horizon):
         survs.append(surv)
+        disc_survs.append(disc * surv)
         (
           s,
           pose,
@@ -881,6 +1080,7 @@ class WbcImagination:
           d,
           x,
           gait_diag,
+          z_foot,
         ) = self._step_fn(
           s,
           pose,
@@ -899,16 +1099,31 @@ class WbcImagination:
         )
         crit_in.append(x)
         gait_diags.append(gait_diag)
+        z_feet.append(z_foot)
+        v_xys.append(s[:, V_YAW][:, :2])
+        wzs.append(s[:, W_B][:, 2])
         ret = ret + disc * surv * r
         rewards.append(r)
         c_t = 1.0 - d
         conts.append(c_t)
         surv = surv * c_t
+        survs_after.append(surv)
         disc *= cfg.gamma
 
+      r_win_rate, win_diag = self.compute_window_gait_rewards(
+        torch.stack(z_feet, dim=1),
+        torch.stack(v_xys, dim=1),
+        torch.stack(wzs, dim=1),
+        cmd_vel,
+        torch.stack(survs_after, dim=1),
+      )
+      r_win_step = r_win_rate * cfg.dt
+      w_surv = torch.stack(disc_survs, dim=1).sum(dim=1)
+      ret = ret + w_surv * r_win_step
       x_H = self.critic_input(s, pose, q_ref_arm, cmd_vel, ee_pose_cmd, xi, k)
       v_H = critic(x_H).squeeze(-1)
       objective = ret + disc * surv * v_H
+      rewards_stack = torch.stack(rewards, dim=1) + r_win_step.detach().unsqueeze(1)
       with torch.no_grad():
         gd = torch.stack(gait_diags, dim=1)
         mov = (gd[..., 0] > 0.5).to(dtype=gd.dtype)
@@ -921,8 +1136,20 @@ class WbcImagination:
         p_moving_mean = (gd[..., 2] * mov).sum() / denom * has_mov
         p_mid_band_frac = (gd[..., 3] * mov).sum() / denom * has_mov
         feet_slide_raw = (gd[..., 4] * mov).sum() / denom * has_mov
+
+        lin_cmd_norm = torch.sqrt((cmd_vel[:, :2] * cmd_vel[:, :2]).sum(dim=-1) + 1e-12)
+        mov_env = (
+          (lin_cmd_norm > cfg.cmd_lin_thresh) | (cmd_vel[:, 2].abs() > cfg.cmd_ang_thresh)
+        ).to(dtype=gd.dtype)
+        mov_env_count = mov_env.sum()
+        env_denom = mov_env_count.clamp_min(1.0)
+        has_mov_env = (mov_env_count > 0).to(dtype=gd.dtype)
+        f_peak_hz = (win_diag["f_peak_hz"] * mov_env).sum() / env_denom * has_mov_env
+        z_peak_lme_cm = (win_diag["z_peak_lme"] * 100.0 * mov_env).sum() / env_denom * has_mov_env
+        diag_corr = (win_diag["diag_corr_raw"] * mov_env).sum() / env_denom * has_mov_env
+        rho_pass = (win_diag["rho_pass"] * mov_env).sum() / env_denom * has_mov_env
       return objective, {
-        "rewards": torch.stack(rewards, dim=1),
+        "rewards": rewards_stack,
         "cont": torch.stack(conts, dim=1),
         "surv": torch.stack(survs + [surv], dim=1),
         "critic_in": torch.stack(crit_in + [x_H], dim=1),
@@ -930,6 +1157,10 @@ class WbcImagination:
         "imag_gait/p_moving_mean": p_moving_mean,
         "imag_gait/p_mid_band_frac": p_mid_band_frac,
         "imag_gait/feet_slide_raw": feet_slide_raw,
+        "imag_gait/f_peak_hz": f_peak_hz,
+        "imag_gait/z_peak_lme_cm": z_peak_lme_cm,
+        "imag_gait/diag_corr": diag_corr,
+        "imag_gait/rho_pass": rho_pass,
       }
     finally:
       for p, req in zip(wm_params, wm_req, strict=True):

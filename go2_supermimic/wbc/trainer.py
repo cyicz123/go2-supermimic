@@ -524,6 +524,10 @@ class WbcTrainer:
       "imag_gait/p_moving_mean": float(data["imag_gait/p_moving_mean"].item()),
       "imag_gait/p_mid_band_frac": float(data["imag_gait/p_mid_band_frac"].item()),
       "imag_gait/feet_slide_raw": float(data["imag_gait/feet_slide_raw"].item()),
+      "imag_gait/f_peak_hz": float(data["imag_gait/f_peak_hz"].item()),
+      "imag_gait/z_peak_lme_cm": float(data["imag_gait/z_peak_lme_cm"].item()),
+      "imag_gait/diag_corr": float(data["imag_gait/diag_corr"].item()),
+      "imag_gait/rho_pass": float(data["imag_gait/rho_pass"].item()),
     }
 
   def save(self, it: int) -> Path:
@@ -604,6 +608,10 @@ class WbcTrainer:
             "imag_gait/p_moving_mean": "p_mov",
             "imag_gait/p_mid_band_frac": "p_mid",
             "imag_gait/feet_slide_raw": "slide_raw",
+            "imag_gait/f_peak_hz": "f_pk",
+            "imag_gait/z_peak_lme_cm": "z_lme",
+            "imag_gait/diag_corr": "d_corr",
+            "imag_gait/rho_pass": "r_pass",
           }
           gait_line: list[str] = []
           for k_stat, v_stat in stats.items():
