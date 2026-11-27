@@ -270,7 +270,7 @@ class WbcRewardWeights:
   """Per-term weights for differentiable WBC imagination (multiplied by dt)."""
 
   # Task tracking
-  track_lin_vel_xy: float = 2.0
+  track_lin_vel_xy: float = 3.0
   track_ang_vel_z: float = 1.0
   ee_pos_exp: float = 3.0
   ee_ori_huber: float = -1.5
@@ -280,19 +280,19 @@ class WbcRewardWeights:
   lin_vel_z_l2: float = -1.0
   ang_vel_xy_l2: float = -0.05
   # Differentiable gait
-  feet_slide_world_soft: float = -1.0
-  feet_clearance_soft: float = -80.0
+  feet_slide_world_soft: float = -0.5
+  feet_clearance_soft: float = -40.0
   standing_feet_air_soft: float = -1.0
   leg_joint_pos: float = -0.1
-  diagonal_trot_soft: float = -0.50
+  diagonal_trot_soft: float = -0.30
   joint_mirror: float = -0.05
-  contact_switch_tv: float = -0.55
+  contact_switch_tv: float = -0.30
   contact_switch_l2: float = 0.0
   # Smoothness & safety
-  action_rate_leg_l2: float = -0.05
+  action_rate_leg_l2: float = -0.03
   action_rate_arm_l2: float = -0.02
-  leg_joint_acc_l2: float = -2.5e-7
-  joint_power: float = -5e-4
+  leg_joint_acc_l2: float = -3.0e-7
+  joint_power: float = -2.0e-4
   joint_torques_l2: float = -2.0e-5
   dof_pos_limits: float = -1.0
   arm_vel_hinge: float = -1.0
@@ -609,9 +609,9 @@ class WbcImagination:
       (lin_cmd_norm > cfg.cmd_lin_thresh) | (cmd_vel[..., 2].abs() > cfg.cmd_ang_thresh)
     ).to(dtype=s1.dtype)
     standing_mask = 1.0 - moving_mask
-    lin_drive = F.relu(lin_cmd_norm - cfg.cmd_lin_thresh) / 0.25
-    ang_drive = F.relu(cmd_vel[..., 2].abs() - 0.08) / 0.42
-    moving_gate = moving_mask * (0.35 + 0.65 * torch.maximum(lin_drive, ang_drive)).clamp(0.0, 1.0)
+    lin_drive = F.relu(lin_cmd_norm - 0.20) / 0.30
+    ang_drive = F.relu(cmd_vel[..., 2].abs() - 0.25) / 0.45
+    moving_gate = moving_mask * torch.maximum(lin_drive, ang_drive).clamp(0.0, 1.0)
 
     dp_contact = p_contact - p_contact0
     eps_tv = 0.01

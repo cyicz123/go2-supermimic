@@ -1,4 +1,4 @@
-"""Tests for Config M gait frequency control rewards, diagnostics, and invariants."""
+"""Tests for Config M2 gait frequency control rewards, diagnostics, and invariants."""
 
 from __future__ import annotations
 
@@ -163,25 +163,25 @@ def _make_rollout_seed(
   }
 
 
-def test_config_m_defaults() -> None:
+def test_config_m2_defaults() -> None:
   cfg = WbcImagineCfg()
   w = WbcRewardWeights()
   assert cfg.ang_vel_sigma == pytest.approx(0.35)
   assert cfg.weights == w
 
-  assert w.contact_switch_tv == pytest.approx(-0.55)
+  assert w.contact_switch_tv == pytest.approx(-0.30)
   assert w.contact_switch_l2 == pytest.approx(0.0)
-  assert w.leg_joint_acc_l2 == pytest.approx(-2.5e-7)
-  assert w.action_rate_leg_l2 == pytest.approx(-0.05)
+  assert w.leg_joint_acc_l2 == pytest.approx(-3.0e-7)
+  assert w.action_rate_leg_l2 == pytest.approx(-0.03)
   assert w.action_rate_arm_l2 == pytest.approx(-0.02)
-  assert w.joint_power == pytest.approx(-5e-4)
+  assert w.joint_power == pytest.approx(-2.0e-4)
   assert w.joint_torques_l2 == pytest.approx(-2.0e-5)
-  assert w.feet_clearance_soft == pytest.approx(-80.0)
-  assert w.feet_slide_world_soft == pytest.approx(-1.0)
-  assert w.diagonal_trot_soft == pytest.approx(-0.50)
+  assert w.feet_clearance_soft == pytest.approx(-40.0)
+  assert w.feet_slide_world_soft == pytest.approx(-0.5)
+  assert w.diagonal_trot_soft == pytest.approx(-0.30)
 
   # Unchanged task, stability, and safety weights
-  assert w.track_lin_vel_xy == pytest.approx(2.0)
+  assert w.track_lin_vel_xy == pytest.approx(3.0)
   assert w.track_ang_vel_z == pytest.approx(1.0)
   assert w.ee_pos_exp == pytest.approx(3.0)
   assert w.ee_ori_huber == pytest.approx(-1.5)
@@ -237,7 +237,7 @@ def test_p_contact0_matches_p_foot_w0_and_terrain_with_grads() -> None:
 
 
 def test_moving_gate_regimes() -> None:
-  B = 7
+  B = 10
   consts = _synthetic_consts(B, "cpu")
   imag = WbcImagination(WbcImagineCfg(dt=0.02), consts, "cpu")
 
@@ -248,27 +248,20 @@ def test_moving_gate_regimes() -> None:
 
   cmd_vel = torch.tensor(
     [
-      [0.0, 0.0, 0.0],    # 0: stationary -> 0.0
-      [0.04, 0.0, 0.0],   # 1: below cmd_lin_thresh (0.05) -> 0.0
-      [0.06, 0.0, 0.0],   # 2: just above cmd_lin_thresh -> 0.35 + 0.65 * (0.01 / 0.25) = 0.376
-      [0.0, 0.0, 0.06],   # 3: just above cmd_ang_thresh (0.05), < 0.08 -> 0.35
-      [0.0, 0.0, 0.20],   # 4: pure yaw turn -> 0.35 + 0.65 * ((0.20 - 0.08) / 0.42)
-      [0.60, 0.0, 0.0],   # 5: high lin speed -> 1.0
-      [0.0, 0.0, -0.60],  # 6: high yaw turn -> 1.0
+      [0.0, 0.0, 0.0],     # 0: stationary -> gate 0.0, moving_mask 0.0
+      [0.04, 0.0, 0.0],    # 1: below cmd_lin_thresh (0.05) -> gate 0.0, moving_mask 0.0
+      [0.15, 0.0, 0.0],    # 2: moving_mask=1, v < 0.20 -> gate 0.0
+      [0.0, 0.0, 0.20],    # 3: moving_mask=1, |wz| < 0.25 -> gate 0.0
+      [0.35, 0.0, 0.0],    # 4: mid lin transition (0.35 - 0.20) / 0.30 -> 0.50
+      [0.0, 0.0, 0.475],   # 5: mid yaw transition (0.475 - 0.25) / 0.45 -> 0.50
+      [0.50, 0.0, 0.0],    # 6: lin saturation boundary -> 1.0
+      [0.65, 0.0, 0.0],    # 7: high lin speed -> 1.0
+      [0.0, 0.0, -0.70],   # 8: yaw saturation boundary -> 1.0
+      [0.0, 0.0, -0.85],   # 9: high yaw turn -> 1.0
     ]
   )
-  expected_gate = torch.tensor(
-    [
-      0.0,
-      0.0,
-      0.35 + 0.65 * (0.01 / 0.25),
-      0.35,
-      0.35 + 0.65 * ((0.20 - 0.08) / 0.42),
-      1.0,
-      1.0,
-    ]
-  )
-  assert expected_gate[2].item() >= 0.35 and expected_gate[2].item() < 1.0
+  expected_gate = torch.tensor([0.0, 0.0, 0.0, 0.0, 0.50, 0.50, 1.0, 1.0, 1.0, 1.0])
+  expected_moving_mask = torch.tensor([0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
 
   a = torch.zeros(B, WBC_NUM_JOINTS)
   a_prev = torch.zeros(B, WBC_NUM_JOINTS)
@@ -279,6 +272,9 @@ def test_moving_gate_regimes() -> None:
   k = imag.rollout_constants(torch.arange(B))
 
   _, terms = imag.compute_rewards(s0, s1, pose0, pose1, a, a_prev, q_ref_arm, cmd_vel, ee_cmd, xi, k)
+  _, terms_diag, gait_diag = imag._compute_rewards_and_gait(
+    s0, s1, pose0, pose1, a, a_prev, q_ref_arm, cmd_vel, ee_cmd, xi, k
+  )
 
   p_c, _, _, _, p_c0 = imag.soft_contact_and_foot_vel(s0, pose0, s1, pose1, 0.02)
   dp = p_c - p_c0
@@ -287,10 +283,25 @@ def test_moving_gate_regimes() -> None:
 
   assert torch.allclose(terms["contact_switch_tv"], tv_raw * expected_gate, atol=1e-6)
   assert torch.allclose(terms["contact_switch_l2"], l2_raw * expected_gate, atol=1e-6)
+  assert torch.allclose(terms_diag["contact_switch_tv"], terms["contact_switch_tv"], atol=1e-6)
   assert terms["contact_switch_tv"][0].item() == 0.0
   assert terms["contact_switch_tv"][1].item() == 0.0
+  assert terms["contact_switch_tv"][2].item() == 0.0
+  assert terms["contact_switch_tv"][3].item() == 0.0
   assert terms["contact_switch_l2"][0].item() == 0.0
   assert terms["contact_switch_l2"][1].item() == 0.0
+  assert terms["contact_switch_l2"][2].item() == 0.0
+  assert terms["contact_switch_l2"][3].item() == 0.0
+  assert terms["contact_switch_tv"][4].item() == pytest.approx((0.50 * tv_raw[4]).item(), rel=1e-6)
+  assert terms["contact_switch_tv"][5].item() == pytest.approx((0.50 * tv_raw[5]).item(), rel=1e-6)
+  assert terms["contact_switch_tv"][6].item() == pytest.approx(tv_raw[6].item(), rel=1e-6)
+  assert terms["contact_switch_tv"][8].item() == pytest.approx(tv_raw[8].item(), rel=1e-6)
+
+  # TB gait_diag must keep moving_mask and un-gated contact_switch_tv_raw
+  assert torch.equal(gait_diag[:, 0], expected_moving_mask)
+  assert torch.allclose(gait_diag[:, 1], tv_raw, atol=1e-6)
+  assert gait_diag[2, 1].item() > 0.0
+  assert gait_diag[3, 1].item() > 0.0
 
 
 def test_contact_switch_monotonic_in_freq_stationary_zero_and_grads() -> None:
