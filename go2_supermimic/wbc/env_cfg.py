@@ -61,7 +61,7 @@ def wbc_command_curriculum(
   env_ids: torch.Tensor | slice | None,
   command_name: str,
   start_step: int = 0,
-  end_step: int = 20_000,
+  end_step: int = 3_000,
   init_progress: float = 0.0,
 ) -> torch.Tensor:
   """Advance a WBC command term's ``curriculum_progress`` toward 1.0 by step counter."""
@@ -147,7 +147,7 @@ def go2_piper_wbc_env_cfg(
   micro_rough: bool = False,
   play: bool = False,
   initial_curriculum_progress: float = 0.0,
-  curriculum_steps: int = 20_000,
+  curriculum_steps: int = 3_000,
 ) -> ManagerBasedRlEnvCfg:
   """Build canonical 210D->18D Go2+Piper WBC mjlab environment config.
 

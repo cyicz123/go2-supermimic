@@ -822,3 +822,13 @@ def test_microrough_trainer_init_collect_wm_and_rollout(tmp_path: Path) -> None:
     assert trainer.nonfinite_steps == 0
   finally:
     trainer.close()
+
+
+def test_wbc_curriculum_defaults_3000() -> None:
+  from go2_supermimic.supermimic.train import TrainCfg
+  from go2_supermimic.wbc.env_cfg import go2_piper_wbc_env_cfg
+
+  assert TrainCfg().target_curriculum_iterations == 3_000
+  env_cfg = go2_piper_wbc_env_cfg()
+  assert env_cfg.curriculum["base_velocity_levels"].params["end_step"] == 3_000
+  assert env_cfg.curriculum["ee_pose_levels"].params["end_step"] == 3_000
