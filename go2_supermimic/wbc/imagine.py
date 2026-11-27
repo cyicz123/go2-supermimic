@@ -311,6 +311,8 @@ class WbcRewardWeights:
   # Base stability
   track_base_height_exp: float = 1.0
   flat_orientation_l2: float = -0.4
+  flat_roll_l2: float | None = None
+  flat_pitch_l2: float | None = None
   lin_vel_z_l2: float = -1.0
   ang_vel_xy_l2: float = -0.05
   # Differentiable gait
@@ -664,7 +666,9 @@ class WbcImagination:
     track_base_height_exp = torch.exp(
       -((s1[..., 0] - cfg.base_height_target).square()) / (cfg.base_height_sigma**2)
     )
-    flat_orientation_l2 = s1[..., GRAV][..., :2].square().sum(dim=-1)
+    gx_sq = s1[..., GRAV][..., 0].square()
+    gy_sq = s1[..., GRAV][..., 1].square()
+    flat_orientation_l2 = gx_sq + gy_sq
     lin_vel_z_l2 = s1[..., V_YAW][..., 2].square()
     ang_vel_xy_l2 = s1[..., W_B][..., :2].square().sum(dim=-1)
 
@@ -778,7 +782,16 @@ class WbcImagination:
       "arm_vel_hinge": arm_vel_hinge,
       "self_collision_penetration": self_collision_penetration,
     }
-    total = sum(getattr(w, name) * val for name, val in terms.items())
+    if w.flat_roll_l2 is None and w.flat_pitch_l2 is None:
+      total = sum(getattr(w, name) * val for name, val in terms.items())
+    else:
+      w_pitch = w.flat_pitch_l2 if w.flat_pitch_l2 is not None else w.flat_orientation_l2
+      w_roll = w.flat_roll_l2 if w.flat_roll_l2 is not None else w.flat_orientation_l2
+      total = sum(
+        getattr(w, name) * val
+        for name, val in terms.items()
+        if name != "flat_orientation_l2"
+      ) + (w_pitch * gx_sq + w_roll * gy_sq)
     with torch.no_grad():
       p_c_det = p_contact.detach()
       p_mid = ((p_c_det > 0.25) & (p_c_det < 0.75)).to(dtype=p_c_det.dtype).mean(dim=-1)
