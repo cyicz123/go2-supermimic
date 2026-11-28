@@ -114,6 +114,13 @@ no PPO; only the terrain runs used other policies, and only to collect world-mod
   command above. Earlier stages used other settings, so this is the setup we ended with, not
   a single run we have reproduced end to end.
 
+### Go2 + Piper 18-DoF Whole-Body Control (WBC)
+
+For training the `Go2Piper-WBC-Flat` / `Go2Piper-WBC-MicroRough` (`210D -> 18D`) policies
+with split roll/pitch penalties, 15-bin adaptive EE command sampling, Stage-1 -> Stage-2
+curriculum, TorchScript export, and measured baselines, see
+[docs/wbc_pitch_stage2_training.md](docs/wbc_pitch_stage2_training.md).
+
 ### Evaluate and record
 
 ```bash

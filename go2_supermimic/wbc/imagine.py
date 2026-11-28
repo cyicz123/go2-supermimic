@@ -311,8 +311,8 @@ class WbcRewardWeights:
   # Base stability
   track_base_height_exp: float = 1.0
   flat_orientation_l2: float = -0.4
-  flat_roll_l2: float | None = None
-  flat_pitch_l2: float | None = None
+  flat_roll_l2: float | None = -1.5
+  flat_pitch_l2: float | None = -0.4
   lin_vel_z_l2: float = -1.0
   ang_vel_xy_l2: float = -0.05
   # Differentiable gait
