@@ -43,15 +43,48 @@ def _clone_inference_buffers(module: torch.nn.Module) -> None:
 
 @dataclass(kw_only=True)
 class WbcTrainCfg(TrainCfg):
-  """Training defaults tailored for pure from-scratch 18-DoF Go2+Piper WBC."""
+  """Training defaults tailored for pure from-scratch 18-DoF Go2+Piper WBC (Arm 2 recipe)."""
 
   task: str = "Go2Piper-WBC-Flat"
+  num_envs: int = 2048
+  buffer_len: int = 600
+  iterations: int = 3500
+  imag_batch: int = 4096
+  lr_decay_iterations: int = 12_000
+  save_interval: int = 500
   driver_policy: str = ""
   warmup_iterations: int = 300
   explore_frac: float = 0.35
   explore_noise: float = 0.35
   wbc_stage: int = 1
   compile: bool = False
+
+
+def resolve_wbc_reward_weights(cfg: TrainCfg) -> WbcRewardWeights:
+  """Resolve ``WbcRewardWeights`` with CLI override precedence.
+
+  Default ``WbcRewardWeights`` uses Arm 2 split orientation penalties
+  (``flat_roll_l2=-1.5``, ``flat_pitch_l2=-0.4``). Explicitly passing
+  ``--wbc-flat-orientation-l2`` clears any un-overridden split term so
+  legacy isotropic overrides take effect instead of being masked by defaults.
+  """
+  weights = WbcRewardWeights()
+  flat_ori = getattr(cfg, "wbc_flat_orientation_l2", None)
+  flat_roll = getattr(cfg, "wbc_flat_roll_l2", None)
+  flat_pitch = getattr(cfg, "wbc_flat_pitch_l2", None)
+  if flat_ori is not None:
+    weights.flat_orientation_l2 = float(flat_ori)
+    if flat_roll is None:
+      weights.flat_roll_l2 = None
+    if flat_pitch is None:
+      weights.flat_pitch_l2 = None
+  if flat_roll is not None:
+    weights.flat_roll_l2 = float(flat_roll)
+  if flat_pitch is not None:
+    weights.flat_pitch_l2 = float(flat_pitch)
+  if getattr(cfg, "wbc_ee_pos_exp", None) is not None:
+    weights.ee_pos_exp = float(cfg.wbc_ee_pos_exp)
+  return weights
 
 
 class WbcTrainer:
@@ -221,15 +254,7 @@ class WbcTrainer:
       ee_term.set_eval_env_mask(~self.explore)
     self.ou = torch.zeros(cfg.num_envs, wbc_st.WBC_NUM_JOINTS, device=self.dev)
 
-    weights = WbcRewardWeights()
-    if getattr(cfg, "wbc_flat_orientation_l2", None) is not None:
-      weights.flat_orientation_l2 = float(cfg.wbc_flat_orientation_l2)
-    if getattr(cfg, "wbc_flat_roll_l2", None) is not None:
-      weights.flat_roll_l2 = float(cfg.wbc_flat_roll_l2)
-    if getattr(cfg, "wbc_flat_pitch_l2", None) is not None:
-      weights.flat_pitch_l2 = float(cfg.wbc_flat_pitch_l2)
-    if getattr(cfg, "wbc_ee_pos_exp", None) is not None:
-      weights.ee_pos_exp = float(cfg.wbc_ee_pos_exp)
+    weights = resolve_wbc_reward_weights(cfg)
     print(
       f"wbc_weights: flat_orientation_l2={weights.flat_orientation_l2} "
       f"flat_roll_l2={weights.flat_roll_l2} flat_pitch_l2={weights.flat_pitch_l2} "

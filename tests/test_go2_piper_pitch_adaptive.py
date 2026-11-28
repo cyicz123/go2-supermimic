@@ -27,8 +27,13 @@ from go2_supermimic.wbc import (
   WbcRobotConsts,
   go2_piper_wbc_env_cfg,
 )
+from go2_supermimic.supermimic.train import TrainCfg
 from go2_supermimic.wbc import state as wbc_st
-from go2_supermimic.wbc.trainer import WbcTrainCfg, WbcTrainer
+from go2_supermimic.wbc.trainer import (
+  WbcTrainCfg,
+  WbcTrainer,
+  resolve_wbc_reward_weights,
+)
 
 
 def _synthetic_consts(num_envs: int, device: str = "cpu") -> WbcRobotConsts:
@@ -147,9 +152,38 @@ def test_leg_joint_pos_no_standing_amplification() -> None:
 def test_pitch_reward_defaults_and_contracts() -> None:
   w = WbcRewardWeights()
   assert w.flat_orientation_l2 == pytest.approx(-0.4)
+  assert w.flat_roll_l2 == pytest.approx(-1.5)
+  assert w.flat_pitch_l2 == pytest.approx(-0.4)
   assert w.ee_pos_exp == pytest.approx(4.5)
   assert w.leg_joint_pos == pytest.approx(-0.1)
   assert w.standing_feet_air_soft == pytest.approx(-1.0)
+
+  wbc_cfg = WbcTrainCfg()
+  assert wbc_cfg.task == "Go2Piper-WBC-Flat"
+  assert wbc_cfg.num_envs == 2048
+  assert wbc_cfg.buffer_len == 600
+  assert wbc_cfg.iterations == 3500
+  assert wbc_cfg.imag_batch == 4096
+  assert wbc_cfg.warmup_iterations == 300
+  assert wbc_cfg.explore_frac == pytest.approx(0.35)
+  assert wbc_cfg.explore_noise == pytest.approx(0.35)
+  assert wbc_cfg.target_curriculum_iterations == 3000
+  assert wbc_cfg.lr_decay_iterations == 12000
+  assert wbc_cfg.save_interval == 500
+  assert wbc_cfg.ee_adaptive_sampling is True
+  assert wbc_cfg.ee_adaptive_uniform_prob == pytest.approx(0.3)
+  assert wbc_cfg.ee_max_xy_radius == pytest.approx(0.69)
+  assert wbc_cfg.compile is False
+
+  # Non-WBC defaults must remain intact.
+  base_cfg = TrainCfg()
+  assert base_cfg.num_envs == 4096
+  assert base_cfg.buffer_len == 1000
+  assert base_cfg.imag_batch == 8192
+  assert base_cfg.lr_decay_iterations == 30000
+  assert base_cfg.explore_frac == pytest.approx(0.25)
+  assert base_cfg.explore_noise == pytest.approx(0.3)
+  assert base_cfg.compile is True
 
   ee_cfg = WbcEePoseCommandCfg(stage=1)
   assert ee_cfg.limit_ranges is not None
@@ -427,22 +461,27 @@ def test_split_roll_pitch_orientation_penalty() -> None:
 
   dt = 0.02
   imag_zero = WbcImagination(
-    WbcImagineCfg(dt=dt, weights=WbcRewardWeights(flat_orientation_l2=0.0)),
+    WbcImagineCfg(
+      dt=dt,
+      weights=WbcRewardWeights(
+        flat_orientation_l2=0.0, flat_roll_l2=None, flat_pitch_l2=None
+      ),
+    ),
     _synthetic_consts(3),
     "cpu",
   )
-  imag_default = WbcImagination(
-    WbcImagineCfg(dt=dt, weights=WbcRewardWeights(flat_orientation_l2=-0.4)),
-    _synthetic_consts(3),
-    "cpu",
-  )
-  imag_none = WbcImagination(
+  imag_iso = WbcImagination(
     WbcImagineCfg(
       dt=dt,
       weights=WbcRewardWeights(
         flat_orientation_l2=-0.4, flat_roll_l2=None, flat_pitch_l2=None
       ),
     ),
+    _synthetic_consts(3),
+    "cpu",
+  )
+  imag_default_arm2 = WbcImagination(
+    WbcImagineCfg(dt=dt),
     _synthetic_consts(3),
     "cpu",
   )
@@ -470,28 +509,29 @@ def test_split_roll_pitch_orientation_penalty() -> None:
   cmd_vel = torch.zeros(3, 3)
   ee_cmd = torch.tensor([[0.5, 0.0, 0.4, 1.0, 0.0, 0.0, 0.0]]).expand(3, 7)
   xi = torch.ones(3, WBC_CONTEXT_DIM)
-  k = imag_default.rollout_constants(torch.arange(3))
+  k = imag_iso.rollout_constants(torch.arange(3))
 
   r_zero, _ = imag_zero.compute_rewards(
     s0, s1, pose0, pose1, a, a_prev, q_ref_arm, cmd_vel, ee_cmd, xi, k
   )
-  r_def, t_def = imag_default.compute_rewards(
+  r_iso, t_iso = imag_iso.compute_rewards(
     s0, s1, pose0, pose1, a, a_prev, q_ref_arm, cmd_vel, ee_cmd, xi, k
   )
-  r_none, _ = imag_none.compute_rewards(
+  r_def_arm2, t_def_arm2 = imag_default_arm2.compute_rewards(
     s0, s1, pose0, pose1, a, a_prev, q_ref_arm, cmd_vel, ee_cmd, xi, k
   )
   r_spl, t_spl = imag_split.compute_rewards(
     s0, s1, pose0, pose1, a, a_prev, q_ref_arm, cmd_vel, ee_cmd, xi, k
   )
 
-  # Default mode (flat_roll_l2=None, flat_pitch_l2=None) must match exact -0.4 * (gx^2 + gy^2)
-  assert torch.equal(r_def, r_none)
-  assert torch.allclose(t_def["flat_orientation_l2"], t_spl["flat_orientation_l2"], atol=1e-7)
+  # Default WbcRewardWeights() must match Arm 2 split (-1.5 roll, -0.4 pitch)
+  assert torch.equal(r_def_arm2, r_spl)
+  assert torch.allclose(t_iso["flat_orientation_l2"], t_spl["flat_orientation_l2"], atol=1e-7)
+  assert torch.allclose(t_def_arm2["flat_orientation_l2"], t_spl["flat_orientation_l2"], atol=1e-7)
 
-  # Upright [0] and pure pitch [2] (-0.4 == -0.4) have identical total rewards across default & split
-  assert r_spl[0].item() == pytest.approx(r_def[0].item(), abs=1e-7)
-  assert r_spl[2].item() == pytest.approx(r_def[2].item(), abs=1e-7)
+  # Upright [0] and pure pitch [2] (-0.4 == -0.4) have identical total rewards across iso & split
+  assert r_spl[0].item() == pytest.approx(r_iso[0].item(), abs=1e-7)
+  assert r_spl[2].item() == pytest.approx(r_iso[2].item(), abs=1e-7)
 
   # Pure roll [1] receives exact -1.5 * gy^2 * dt, pure pitch [2] receives -0.4 * gx^2 * dt
   pen_roll = (r_spl[1] - r_zero[1]).item() / dt
@@ -499,3 +539,72 @@ def test_split_roll_pitch_orientation_penalty() -> None:
   assert pen_roll == pytest.approx(-1.5 * (0.3**2), rel=1e-5)
   assert pen_pitch == pytest.approx(-0.4 * (0.3**2), rel=1e-5)
   assert (pen_roll / pen_pitch) == pytest.approx(3.75, rel=1e-5)
+
+
+def test_resolve_wbc_reward_weights_cli_precedence() -> None:
+  # 1. No CLI overrides -> Arm 2 split defaults (roll=-1.5, pitch=-0.4)
+  w_def = resolve_wbc_reward_weights(WbcTrainCfg())
+  assert w_def.flat_orientation_l2 == pytest.approx(-0.4)
+  assert w_def.flat_roll_l2 == pytest.approx(-1.5)
+  assert w_def.flat_pitch_l2 == pytest.approx(-0.4)
+
+  # 2. Explicit --wbc-flat-orientation-l2 alone -> isotropic mode (clears default split)
+  w_iso = resolve_wbc_reward_weights(WbcTrainCfg(wbc_flat_orientation_l2=-0.4))
+  assert w_iso.flat_orientation_l2 == pytest.approx(-0.4)
+  assert w_iso.flat_roll_l2 is None
+  assert w_iso.flat_pitch_l2 is None
+
+  # 3. --wbc-flat-orientation-l2 + --wbc-flat-roll-l2 -> pitch falls back to flat_orientation_l2
+  w_mixed = resolve_wbc_reward_weights(
+    WbcTrainCfg(wbc_flat_orientation_l2=-0.6, wbc_flat_roll_l2=-1.5)
+  )
+  assert w_mixed.flat_orientation_l2 == pytest.approx(-0.6)
+  assert w_mixed.flat_roll_l2 == pytest.approx(-1.5)
+  assert w_mixed.flat_pitch_l2 is None
+
+  # 4. --wbc-flat-pitch-l2 alone -> keeps Arm 2/3 roll=-1.5, overrides pitch
+  w_arm3_quick = resolve_wbc_reward_weights(WbcTrainCfg(wbc_flat_pitch_l2=-0.20))
+  assert w_arm3_quick.flat_roll_l2 == pytest.approx(-1.5)
+  assert w_arm3_quick.flat_pitch_l2 == pytest.approx(-0.20)
+
+  # 5. Explicit split overrides + isotropic flag -> explicit split takes precedence
+  w_arm3 = resolve_wbc_reward_weights(
+    WbcTrainCfg(wbc_flat_orientation_l2=-0.4, wbc_flat_roll_l2=-1.5, wbc_flat_pitch_l2=-0.20)
+  )
+  assert w_arm3.flat_orientation_l2 == pytest.approx(-0.4)
+  assert w_arm3.flat_roll_l2 == pytest.approx(-1.5)
+  assert w_arm3.flat_pitch_l2 == pytest.approx(-0.20)
+
+  # Verify end-to-end reward computation for w_iso vs w_mixed
+  dt = 0.02
+  s0 = _make_standing_state(3, "cpu")
+  s1 = _make_standing_state(3, "cpu")
+  s1[1, wbc_st.GRAV] = torch.tensor([0.0, 0.3, -math.sqrt(1.0 - 0.09)])
+  s1[2, wbc_st.GRAV] = torch.tensor([0.3, 0.0, -math.sqrt(1.0 - 0.09)])
+  pose0 = torch.zeros(3, 3)
+  pose1 = torch.zeros(3, 3)
+  a = torch.zeros(3, WBC_NUM_JOINTS)
+  a_prev = torch.zeros(3, WBC_NUM_JOINTS)
+  q_ref_arm = torch.zeros(3, WBC_NUM_ARM_JOINTS)
+  cmd_vel = torch.zeros(3, 3)
+  ee_cmd = torch.tensor([[0.5, 0.0, 0.4, 1.0, 0.0, 0.0, 0.0]]).expand(3, 7)
+  xi = torch.ones(3, WBC_CONTEXT_DIM)
+  consts = _synthetic_consts(3)
+  k = WbcImagination(WbcImagineCfg(dt=dt), consts, "cpu").rollout_constants(torch.arange(3))
+
+  r_zero, _ = WbcImagination(
+    WbcImagineCfg(dt=dt, weights=resolve_wbc_reward_weights(WbcTrainCfg(wbc_flat_orientation_l2=0.0))),
+    consts,
+    "cpu",
+  ).compute_rewards(s0, s1, pose0, pose1, a, a_prev, q_ref_arm, cmd_vel, ee_cmd, xi, k)
+  r_iso, _ = WbcImagination(WbcImagineCfg(dt=dt, weights=w_iso), consts, "cpu").compute_rewards(
+    s0, s1, pose0, pose1, a, a_prev, q_ref_arm, cmd_vel, ee_cmd, xi, k
+  )
+  r_mix, _ = WbcImagination(WbcImagineCfg(dt=dt, weights=w_mixed), consts, "cpu").compute_rewards(
+    s0, s1, pose0, pose1, a, a_prev, q_ref_arm, cmd_vel, ee_cmd, xi, k
+  )
+
+  assert (r_iso[1] - r_zero[1]).item() / dt == pytest.approx(-0.4 * (0.3**2), rel=1e-5)
+  assert (r_iso[2] - r_zero[2]).item() / dt == pytest.approx(-0.4 * (0.3**2), rel=1e-5)
+  assert (r_mix[1] - r_zero[1]).item() / dt == pytest.approx(-1.5 * (0.3**2), rel=1e-5)
+  assert (r_mix[2] - r_zero[2]).item() / dt == pytest.approx(-0.6 * (0.3**2), rel=1e-5)
